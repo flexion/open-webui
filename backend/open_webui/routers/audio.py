@@ -3,21 +3,25 @@ import json
 import logging
 import os
 import uuid
+import html
 from functools import lru_cache
-from pathlib import Path
 from pydub import AudioSegment
 from pydub.silence import split_on_silence
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
+from fnmatch import fnmatch
 import aiohttp
 import aiofiles
 import requests
 import mimetypes
+from urllib.parse import urljoin, quote
 
 from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     HTTPException,
     Request,
     UploadFile,
@@ -93,12 +97,9 @@ def is_audio_conversion_required(file_path):
             # File is AAC/mp4a audio, recommend mp3 conversion
             return True
 
-        # If the codec name or file extension is in the supported formats
-        if (
-            codec_name in SUPPORTED_FORMATS
-            or os.path.splitext(file_path)[1][1:].lower() in SUPPORTED_FORMATS
-        ):
-            return False  # Already supported
+        # If the codec name is in the supported formats
+        if codec_name in SUPPORTED_FORMATS:
+            return False
 
         return True
     except Exception as e:
@@ -153,6 +154,7 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
 class TTSConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
+    OPENAI_PARAMS: Optional[dict] = None
     API_KEY: str
     ENGINE: str
     MODEL: str
@@ -168,6 +170,7 @@ class STTConfigForm(BaseModel):
     OPENAI_API_KEY: str
     ENGINE: str
     MODEL: str
+    SUPPORTED_CONTENT_TYPES: list[str] = []
     WHISPER_MODEL: str
     DEEPGRAM_API_KEY: str
     AZURE_API_KEY: str
@@ -188,6 +191,7 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
         "tts": {
             "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
             "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
+            "OPENAI_PARAMS": request.app.state.config.TTS_OPENAI_PARAMS,
             "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
@@ -202,6 +206,7 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
             "OPENAI_API_KEY": request.app.state.config.STT_OPENAI_API_KEY,
             "ENGINE": request.app.state.config.STT_ENGINE,
             "MODEL": request.app.state.config.STT_MODEL,
+            "SUPPORTED_CONTENT_TYPES": request.app.state.config.STT_SUPPORTED_CONTENT_TYPES,
             "WHISPER_MODEL": request.app.state.config.WHISPER_MODEL,
             "DEEPGRAM_API_KEY": request.app.state.config.DEEPGRAM_API_KEY,
             "AZURE_API_KEY": request.app.state.config.AUDIO_STT_AZURE_API_KEY,
@@ -219,6 +224,7 @@ async def update_audio_config(
 ):
     request.app.state.config.TTS_OPENAI_API_BASE_URL = form_data.tts.OPENAI_API_BASE_URL
     request.app.state.config.TTS_OPENAI_API_KEY = form_data.tts.OPENAI_API_KEY
+    request.app.state.config.TTS_OPENAI_PARAMS = form_data.tts.OPENAI_PARAMS
     request.app.state.config.TTS_API_KEY = form_data.tts.API_KEY
     request.app.state.config.TTS_ENGINE = form_data.tts.ENGINE
     request.app.state.config.TTS_MODEL = form_data.tts.MODEL
@@ -236,6 +242,10 @@ async def update_audio_config(
     request.app.state.config.STT_OPENAI_API_KEY = form_data.stt.OPENAI_API_KEY
     request.app.state.config.STT_ENGINE = form_data.stt.ENGINE
     request.app.state.config.STT_MODEL = form_data.stt.MODEL
+    request.app.state.config.STT_SUPPORTED_CONTENT_TYPES = (
+        form_data.stt.SUPPORTED_CONTENT_TYPES
+    )
+
     request.app.state.config.WHISPER_MODEL = form_data.stt.WHISPER_MODEL
     request.app.state.config.DEEPGRAM_API_KEY = form_data.stt.DEEPGRAM_API_KEY
     request.app.state.config.AUDIO_STT_AZURE_API_KEY = form_data.stt.AZURE_API_KEY
@@ -250,15 +260,18 @@ async def update_audio_config(
         request.app.state.faster_whisper_model = set_faster_whisper_model(
             form_data.stt.WHISPER_MODEL, WHISPER_MODEL_AUTO_UPDATE
         )
+    else:
+        request.app.state.faster_whisper_model = None
 
     return {
         "tts": {
-            "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
-            "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
-            "API_KEY": request.app.state.config.TTS_API_KEY,
             "ENGINE": request.app.state.config.TTS_ENGINE,
             "MODEL": request.app.state.config.TTS_MODEL,
             "VOICE": request.app.state.config.TTS_VOICE,
+            "OPENAI_API_BASE_URL": request.app.state.config.TTS_OPENAI_API_BASE_URL,
+            "OPENAI_API_KEY": request.app.state.config.TTS_OPENAI_API_KEY,
+            "OPENAI_PARAMS": request.app.state.config.TTS_OPENAI_PARAMS,
+            "API_KEY": request.app.state.config.TTS_API_KEY,
             "SPLIT_ON": request.app.state.config.TTS_SPLIT_ON,
             "AZURE_SPEECH_REGION": request.app.state.config.TTS_AZURE_SPEECH_REGION,
             "AZURE_SPEECH_BASE_URL": request.app.state.config.TTS_AZURE_SPEECH_BASE_URL,
@@ -269,6 +282,7 @@ async def update_audio_config(
             "OPENAI_API_KEY": request.app.state.config.STT_OPENAI_API_KEY,
             "ENGINE": request.app.state.config.STT_ENGINE,
             "MODEL": request.app.state.config.STT_MODEL,
+            "SUPPORTED_CONTENT_TYPES": request.app.state.config.STT_SUPPORTED_CONTENT_TYPES,
             "WHISPER_MODEL": request.app.state.config.WHISPER_MODEL,
             "DEEPGRAM_API_KEY": request.app.state.config.DEEPGRAM_API_KEY,
             "AZURE_API_KEY": request.app.state.config.AUDIO_STT_AZURE_API_KEY,
@@ -318,6 +332,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         log.exception(e)
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
+    r = None
     if request.app.state.config.TTS_ENGINE == "openai":
         payload["model"] = request.app.state.config.TTS_MODEL
 
@@ -326,7 +341,12 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             async with aiohttp.ClientSession(
                 timeout=timeout, trust_env=True
             ) as session:
-                async with session.post(
+                payload = {
+                    **payload,
+                    **(request.app.state.config.TTS_OPENAI_PARAMS or {}),
+                }
+
+                r = await session.post(
                     url=f"{request.app.state.config.TTS_OPENAI_API_BASE_URL}/audio/speech",
                     json=payload,
                     headers={
@@ -334,7 +354,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                         "Authorization": f"Bearer {request.app.state.config.TTS_OPENAI_API_KEY}",
                         **(
                             {
-                                "X-OpenWebUI-User-Name": user.name,
+                                "X-OpenWebUI-User-Name": quote(user.name, safe=" "),
                                 "X-OpenWebUI-User-Id": user.id,
                                 "X-OpenWebUI-User-Email": user.email,
                                 "X-OpenWebUI-User-Role": user.role,
@@ -344,14 +364,15 @@ async def speech(request: Request, user=Depends(get_verified_user)):
                         ),
                     },
                     ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                ) as r:
-                    r.raise_for_status()
+                )
 
-                    async with aiofiles.open(file_path, "wb") as f:
-                        await f.write(await r.read())
+                r.raise_for_status()
 
-                    async with aiofiles.open(file_body_path, "w") as f:
-                        await f.write(json.dumps(payload))
+                async with aiofiles.open(file_path, "wb") as f:
+                    await f.write(await r.read())
+
+                async with aiofiles.open(file_body_path, "w") as f:
+                    await f.write(json.dumps(payload))
 
             return FileResponse(file_path)
 
@@ -359,18 +380,22 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             log.exception(e)
             detail = None
 
-            try:
-                if r.status != 200:
-                    res = await r.json()
+            status_code = 500
+            detail = f"Open WebUI: Server Connection Error"
 
+            if r is not None:
+                status_code = r.status
+
+                try:
+                    res = await r.json()
                     if "error" in res:
-                        detail = f"External: {res['error'].get('message', '')}"
-            except Exception:
-                detail = f"External: {e}"
+                        detail = f"External: {res['error']}"
+                except Exception:
+                    detail = f"External: {e}"
 
             raise HTTPException(
-                status_code=getattr(r, "status", 500) if r else 500,
-                detail=detail if detail else "Open WebUI: Server Connection Error",
+                status_code=status_code,
+                detail=detail,
             )
 
     elif request.app.state.config.TTS_ENGINE == "elevenlabs":
@@ -443,7 +468,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
         try:
             data = f"""<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="{locale}">
-                <voice name="{language}">{payload["input"]}</voice>
+                <voice name="{language}">{html.escape(payload["input"])}</voice>
             </speak>"""
             timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
             async with aiohttp.ClientSession(
@@ -527,10 +552,17 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         return FileResponse(file_path)
 
 
-def transcription_handler(request, file_path):
+def transcription_handler(request, file_path, metadata):
     filename = os.path.basename(file_path)
     file_dir = os.path.dirname(file_path)
     id = filename.split(".")[0]
+
+    metadata = metadata or {}
+
+    languages = [
+        metadata.get("language", None) if not WHISPER_LANGUAGE else WHISPER_LANGUAGE,
+        None,  # Always fallback to None in case transcription fails
+    ]
 
     if request.app.state.config.STT_ENGINE == "":
         if request.app.state.faster_whisper_model is None:
@@ -543,7 +575,7 @@ def transcription_handler(request, file_path):
             file_path,
             beam_size=5,
             vad_filter=request.app.state.config.WHISPER_VAD_FILTER,
-            language=WHISPER_LANGUAGE,
+            language=languages[0],
         )
         log.info(
             "Detected language '%s' with probability %f"
@@ -563,14 +595,26 @@ def transcription_handler(request, file_path):
     elif request.app.state.config.STT_ENGINE == "openai":
         r = None
         try:
-            r = requests.post(
-                url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
-                headers={
-                    "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
-                },
-                files={"file": (filename, open(file_path, "rb"))},
-                data={"model": request.app.state.config.STT_MODEL},
-            )
+            for language in languages:
+                payload = {
+                    "model": request.app.state.config.STT_MODEL,
+                }
+
+                if language:
+                    payload["language"] = language
+
+                r = requests.post(
+                    url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
+                    headers={
+                        "Authorization": f"Bearer {request.app.state.config.STT_OPENAI_API_KEY}"
+                    },
+                    files={"file": (filename, open(file_path, "rb"))},
+                    data=payload,
+                )
+
+                if r.status_code == 200:
+                    # Successful transcription
+                    break
 
             r.raise_for_status()
             data = r.json()
@@ -612,18 +656,26 @@ def transcription_handler(request, file_path):
                 "Content-Type": mime,
             }
 
-            # Add model if specified
-            params = {}
-            if request.app.state.config.STT_MODEL:
-                params["model"] = request.app.state.config.STT_MODEL
+            for language in languages:
+                params = {}
+                if request.app.state.config.STT_MODEL:
+                    params["model"] = request.app.state.config.STT_MODEL
 
-            # Make request to Deepgram API
-            r = requests.post(
-                "https://api.deepgram.com/v1/listen",
-                headers=headers,
-                params=params,
-                data=file_data,
-            )
+                if language:
+                    params["language"] = language
+
+                # Make request to Deepgram API
+                r = requests.post(
+                    "https://api.deepgram.com/v1/listen?smart_format=true",
+                    headers=headers,
+                    params=params,
+                    data=file_data,
+                )
+
+                if r.status_code == 200:
+                    # Successful transcription
+                    break
+
             r.raise_for_status()
             response_data = r.json()
 
@@ -777,8 +829,8 @@ def transcription_handler(request, file_path):
             )
 
 
-def transcribe(request: Request, file_path):
-    log.info(f"transcribe: {file_path}")
+def transcribe(request: Request, file_path: str, metadata: Optional[dict] = None):
+    log.info(f"transcribe: {file_path} {metadata}")
 
     if is_audio_conversion_required(file_path):
         file_path = convert_audio_to_mp3(file_path)
@@ -804,7 +856,7 @@ def transcribe(request: Request, file_path):
         with ThreadPoolExecutor() as executor:
             # Submit tasks for each chunk_path
             futures = [
-                executor.submit(transcription_handler, request, chunk_path)
+                executor.submit(transcription_handler, request, chunk_path, metadata)
                 for chunk_path in chunk_paths
             ]
             # Gather results as they complete
@@ -812,10 +864,9 @@ def transcribe(request: Request, file_path):
                 try:
                     results.append(future.result())
                 except Exception as transcribe_exc:
-                    log.exception(f"Error transcribing chunk: {transcribe_exc}")
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Error during transcription.",
+                        detail=f"Error transcribing chunk: {transcribe_exc}",
                     )
     finally:
         # Clean up only the temporary chunks, never the original file
@@ -897,14 +948,23 @@ def split_audio(file_path, max_bytes, format="mp3", bitrate="32k"):
 def transcription(
     request: Request,
     file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
     user=Depends(get_verified_user),
 ):
     log.info(f"file.content_type: {file.content_type}")
 
-    SUPPORTED_CONTENT_TYPES = {"video/webm"}  # Extend if you add more video types!
-    if not (
-        file.content_type.startswith("audio/")
-        or file.content_type in SUPPORTED_CONTENT_TYPES
+    stt_supported_content_types = getattr(
+        request.app.state.config, "STT_SUPPORTED_CONTENT_TYPES", []
+    )
+
+    if not any(
+        fnmatch(file.content_type, content_type)
+        for content_type in (
+            stt_supported_content_types
+            if stt_supported_content_types
+            and any(t.strip() for t in stt_supported_content_types)
+            else ["audio/*", "video/webm"]
+        )
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -926,7 +986,12 @@ def transcription(
             f.write(contents)
 
         try:
-            result = transcribe(request, file_path)
+            metadata = None
+
+            if language:
+                metadata = {"language": language}
+
+            result = transcribe(request, file_path, metadata)
 
             return {
                 **result,
