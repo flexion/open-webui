@@ -16,6 +16,7 @@ import time
 import secrets
 from cryptography.fernet import Fernet
 from typing import Literal
+from urllib.parse import quote
 
 import aiohttp
 from authlib.integrations.starlette_client import OAuth
@@ -44,6 +45,7 @@ from open_webui.config import (
     ENABLE_OAUTH_GROUP_CREATION,
     OAUTH_BLOCKED_GROUPS,
     OAUTH_GROUPS_SEPARATOR,
+    OAUTH_ROLES_SEPARATOR,
     OAUTH_ROLES_CLAIM,
     OAUTH_SUB_CLAIM,
     OAUTH_GROUPS_CLAIM,
@@ -1019,12 +1021,45 @@ class OAuthManager:
             # Default/fallback role if no matching roles are found
             role = auth_manager_config.DEFAULT_USER_ROLE
 
-            # Next block extracts the roles from the user data, accepting nested claims of any depth
-            if oauth_claim and oauth_allowed_roles and oauth_admin_roles:
-                claim_data = user_data
-                nested_claims = oauth_claim.split(".")
-                for nested_claim in nested_claims:
-                    claim_data = claim_data.get(nested_claim, {})
+            # Check if this is Google OAuth with Cloud Identity scope
+            if (
+                    provider == "google"
+                    and access_token
+                    and "https://www.googleapis.com/auth/cloud-identity.groups.readonly"
+                    in GOOGLE_OAUTH_SCOPE.value
+            ):
+
+                log.debug(
+                    "Google OAuth with Cloud Identity scope detected - fetching groups via API"
+                )
+                user_email = user_data.get(auth_manager_config.OAUTH_EMAIL_CLAIM, "")
+                if user_email:
+                    try:
+                        google_groups = (
+                            await self._fetch_google_groups_via_cloud_identity(
+                                access_token, user_email
+                            )
+                        )
+                        # Store groups in user_data for potential group management later
+                        if "google_groups" not in user_data:
+                            user_data["google_groups"] = google_groups
+
+                        # Use Google groups as oauth_roles for role determination
+                        oauth_roles = google_groups
+                        log.debug(f"Using Google groups as roles: {oauth_roles}")
+                    except Exception as e:
+                        log.error(f"Failed to fetch Google groups: {e}")
+                        # Fall back to default behavior with claims
+                        oauth_roles = []
+
+            # If not using Google groups or Google groups fetch failed, use traditional claims method
+            if not oauth_roles:
+                # Next block extracts the roles from the user data, accepting nested claims of any depth
+                if oauth_claim and oauth_allowed_roles and oauth_admin_roles:
+                    claim_data = user_data
+                    nested_claims = oauth_claim.split(".")
+                    for nested_claim in nested_claims:
+                        claim_data = claim_data.get(nested_claim, {})
 
                 # Try flat claim structure as alternative
                 if not claim_data:
@@ -1034,7 +1069,13 @@ class OAuthManager:
 
                 if isinstance(claim_data, list):
                     oauth_roles = claim_data
-                if isinstance(claim_data, str) or isinstance(claim_data, int):
+                elif isinstance(claim_data, str):
+                    # Split by the configured separator if present
+                    if OAUTH_ROLES_SEPARATOR and OAUTH_ROLES_SEPARATOR in claim_data:
+                        oauth_roles = claim_data.split(OAUTH_ROLES_SEPARATOR)
+                    else:
+                        oauth_roles = [claim_data]
+                elif isinstance(claim_data, int):
                     oauth_roles = [str(claim_data)]
 
             # Check if this is Google OAuth with Cloud Identity scope
@@ -1220,7 +1261,11 @@ class OAuthManager:
                 if isinstance(claim_data, list):
                     user_oauth_groups = claim_data
                 elif isinstance(claim_data, str):
-                    user_oauth_groups = [claim_data]
+                    # Split by the configured separator if present
+                    if OAUTH_GROUPS_SEPARATOR in claim_data:
+                        user_oauth_groups = claim_data.split(OAUTH_GROUPS_SEPARATOR)
+                    else:
+                        user_oauth_groups = [claim_data]
                 else:
                     user_oauth_groups = []
 
@@ -1451,7 +1496,10 @@ class OAuthManager:
                 log.warning(f"OAuth callback failed, sub is missing: {user_data}")
                 raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
-            provider_sub = f"{provider}@{sub}"
+            oauth_data = {}
+            oauth_data[provider] = {
+                "sub": sub,
+            }
 
             # Email extraction
             email_claim = auth_manager_config.OAUTH_EMAIL_CLAIM
@@ -1498,13 +1546,12 @@ class OAuthManager:
                         log.warning(f"Error fetching GitHub email: {e}")
                         raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
                 elif ENABLE_OAUTH_EMAIL_FALLBACK:
-                    email = f"{provider_sub}.local"
+                    email = f"{provider}@{sub}.local"
                 else:
                     log.warning(f"OAuth callback failed, email is missing: {user_data}")
                     raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
             email = email.lower()
-
             # If allowed domains are configured, check if the email domain is in the list
             if (
                 "*" not in auth_manager_config.OAUTH_ALLOWED_DOMAINS
@@ -1525,7 +1572,7 @@ class OAuthManager:
                     user = Users.get_user_by_email(email)
                     if user:
                         # Update the user with the new oauth sub
-                        Users.update_user_oauth_sub_by_id(user.id, provider_sub)
+                        Users.update_user_oauth_by_id(user.id, provider, sub)
 
             if user:
                 determined_role = await self.get_user_role(
@@ -1533,7 +1580,9 @@ class OAuthManager:
                 )
                 if user.role != determined_role:
                     Users.update_user_role_by_id(user.id, determined_role)
-
+                    # Update the user object in memory as well,
+                    # to avoid problems with the ENABLE_OAUTH_GROUP_MANAGEMENT check below
+                    user.role = determined_role
                 # Update profile picture if enabled and different from current
                 if auth_manager_config.OAUTH_UPDATE_PICTURE_ON_LOGIN:
                     picture_claim = auth_manager_config.OAUTH_PICTURE_CLAIM
@@ -1549,7 +1598,6 @@ class OAuthManager:
                                 user.id, processed_picture_url
                             )
                             log.debug(f"Updated profile picture for user {user.email}")
-
             if not user:
                 # If the user does not exist, check if signups are enabled
                 if auth_manager_config.ENABLE_OAUTH_SIGNUP:
@@ -1576,32 +1624,32 @@ class OAuthManager:
                         log.warning("Username claim is missing, using email as name")
                         name = email
 
-                    role = await self.get_user_role(
-                        None, user_data, provider, token.get("access_token")
-                    )
+                role = await self.get_user_role(
+                    None, user_data, provider, token.get("access_token")
+                )
 
-                    user = Auths.insert_new_auth(
-                        email=email,
-                        password=get_password_hash(
-                            str(uuid.uuid4())
-                        ),  # Random password, not used
-                        name=name,
-                        profile_image_url=picture_url,
-                        role=role,
-                        oauth_sub=provider_sub,
-                    )
+                user = Auths.insert_new_auth(
+                    email=email,
+                    password=get_password_hash(
+                        str(uuid.uuid4())
+                    ),  # Random password, not used
+                    name=name,
+                    profile_image_url=picture_url,
+                    role=role,
+                    oauth_sub=provider_sub,
+                )
 
-                    if auth_manager_config.WEBHOOK_URL:
-                        await post_webhook(
-                            WEBUI_NAME,
-                            auth_manager_config.WEBHOOK_URL,
-                            WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-                            {
-                                "action": "signup",
-                                "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-                                "user": user.model_dump_json(exclude_none=True),
-                            },
-                        )
+                if auth_manager_config.WEBHOOK_URL:
+                    await post_webhook(
+                        WEBUI_NAME,
+                        auth_manager_config.WEBHOOK_URL,
+                        WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                        {
+                            "action": "signup",
+                            "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                            "user": user.model_dump_json(exclude_none=True),
+                        },
+                    )
                 else:
                     raise HTTPException(
                         status.HTTP_403_FORBIDDEN,
@@ -1613,10 +1661,7 @@ class OAuthManager:
                 expires_delta=parse_duration(auth_manager_config.JWT_EXPIRES_IN),
             )
 
-            if (
-                    auth_manager_config.ENABLE_OAUTH_GROUP_MANAGEMENT
-                    and user.role != "admin"
-            ):
+            if auth_manager_config.ENABLE_OAUTH_GROUP_MANAGEMENT and user.role != "admin":
                 await self.update_user_groups(
                     user=user,
                     user_data=user_data,
