@@ -1599,7 +1599,7 @@ class OAuthManager:
                         name=name,
                         profile_image_url=picture_url,
                         role=role,
-                        oauth_sub=oauth_data,
+                        oauth=oauth_data,
                     )
 
                     if auth_manager_config.WEBHOOK_URL:
