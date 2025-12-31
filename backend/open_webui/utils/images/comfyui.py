@@ -79,14 +79,15 @@ def get_images(ws, prompt, client_id, base_url, api_key):
             continue  # previews are binary data
 
     history = get_history(prompt_id, base_url, api_key)[prompt_id]
-    for node_id in history["outputs"]:
-        node_output = history["outputs"][node_id]
-        if "images" in node_output:
-            for image in node_output["images"]:
-                url = get_image_url(
-                    image["filename"], image["subfolder"], image["type"], base_url
-                )
-                output_images.append({"url": url})
+    for o in history["outputs"]:
+        for node_id in history["outputs"]:
+            node_output = history["outputs"][node_id]
+            if "images" in node_output:
+                for image in node_output["images"]:
+                    url = get_image_url(
+                        image["filename"], image["subfolder"], image["type"], base_url
+                    )
+                    output_images.append({"url": url})
     return {"data": output_images}
 
 

@@ -360,7 +360,7 @@ def check_model_access(user, model):
             raise Exception("Model not found")
 
 
-def get_filtered_models(models, user, db=None):
+def get_filtered_models(models, user):
     # Filter out models that the user does not have access to
     if (
         user.role == "user"
@@ -373,7 +373,7 @@ def get_filtered_models(models, user, db=None):
         }
 
         filtered_models = []
-        user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id, db=db)}
+        user_group_ids = {group.id for group in Groups.get_groups_by_member_id(user.id)}
         for model in models:
             if model.get("arena"):
                 if has_access(

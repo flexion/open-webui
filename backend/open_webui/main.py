@@ -102,9 +102,7 @@ from open_webui.routers.retrieval import (
     get_rf,
 )
 
-
-from sqlalchemy.orm import Session
-from open_webui.internal.db import ScopedSession, engine, get_session
+from open_webui.internal.db import Session, engine
 
 from open_webui.models.functions import Functions
 from open_webui.models.models import Models
@@ -1326,7 +1324,7 @@ app.add_middleware(APIKeyRestrictionMiddleware)
 async def commit_session_after_request(request: Request, call_next):
     response = await call_next(request)
     # log.debug("Commit session after request")
-    ScopedSession.commit()
+    Session.commit()
     return response
 
 
@@ -2282,13 +2280,8 @@ async def oauth_login(provider: str, request: Request):
 #    - Email addresses are considered unique, so we fail registration if the email address is already taken
 @app.get("/oauth/{provider}/login/callback")
 @app.get("/oauth/{provider}/callback")  # Legacy endpoint
-async def oauth_login_callback(
-    provider: str,
-    request: Request,
-    response: Response,
-    db: Session = Depends(get_session),
-):
-    return await oauth_manager.handle_callback(request, provider, response, db=db)
+async def oauth_login_callback(provider: str, request: Request, response: Response):
+    return await oauth_manager.handle_callback(request, provider, response)
 
 
 @app.get("/manifest.json")
@@ -2347,7 +2340,7 @@ async def healthcheck():
 
 @app.get("/health/db")
 async def healthcheck_with_db():
-    ScopedSession.execute(text("SELECT 1;")).all()
+    Session.execute(text("SELECT 1;")).all()
     return {"status": True}
 
 

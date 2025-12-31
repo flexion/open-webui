@@ -7,8 +7,7 @@ from typing import Optional
 from open_webui.models.memories import Memories, MemoryModel
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 from open_webui.utils.auth import get_verified_user
-from open_webui.internal.db import get_session
-from sqlalchemy.orm import Session
+
 
 log = logging.getLogger(__name__)
 
@@ -26,8 +25,8 @@ async def get_embeddings(request: Request):
 
 
 @router.get("/", response_model=list[MemoryModel])
-async def get_memories(user=Depends(get_verified_user), db: Session = Depends(get_session)):
-    return Memories.get_memories_by_user_id(user.id, db=db)
+async def get_memories(user=Depends(get_verified_user)):
+    return Memories.get_memories_by_user_id(user.id)
 
 
 ############################
@@ -48,9 +47,8 @@ async def add_memory(
     request: Request,
     form_data: AddMemoryForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
-    memory = Memories.insert_new_memory(user.id, form_data.content, db=db)
+    memory = Memories.insert_new_memory(user.id, form_data.content)
 
     vector = await request.app.state.EMBEDDING_FUNCTION(memory.content, user=user)
 
@@ -81,9 +79,9 @@ class QueryMemoryForm(BaseModel):
 
 @router.post("/query")
 async def query_memory(
-    request: Request, form_data: QueryMemoryForm, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    request: Request, form_data: QueryMemoryForm, user=Depends(get_verified_user)
 ):
-    memories = Memories.get_memories_by_user_id(user.id, db=db)
+    memories = Memories.get_memories_by_user_id(user.id)
     if not memories:
         raise HTTPException(status_code=404, detail="No memories found for user")
 
@@ -103,11 +101,11 @@ async def query_memory(
 ############################
 @router.post("/reset", response_model=bool)
 async def reset_memory_from_vector_db(
-    request: Request, user=Depends(get_verified_user), db: Session = Depends(get_session)
+    request: Request, user=Depends(get_verified_user)
 ):
     VECTOR_DB_CLIENT.delete_collection(f"user-memory-{user.id}")
 
-    memories = Memories.get_memories_by_user_id(user.id, db=db)
+    memories = Memories.get_memories_by_user_id(user.id)
 
     # Generate vectors in parallel
     vectors = await asyncio.gather(
@@ -142,8 +140,8 @@ async def reset_memory_from_vector_db(
 
 
 @router.delete("/delete/user", response_model=bool)
-async def delete_memory_by_user_id(user=Depends(get_verified_user), db: Session = Depends(get_session)):
-    result = Memories.delete_memories_by_user_id(user.id, db=db)
+async def delete_memory_by_user_id(user=Depends(get_verified_user)):
+    result = Memories.delete_memories_by_user_id(user.id)
 
     if result:
         try:
@@ -166,10 +164,9 @@ async def update_memory_by_id(
     request: Request,
     form_data: MemoryUpdateModel,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
     memory = Memories.update_memory_by_id_and_user_id(
-        memory_id, user.id, form_data.content, db=db
+        memory_id, user.id, form_data.content
     )
     if memory is None:
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -201,8 +198,8 @@ async def update_memory_by_id(
 
 
 @router.delete("/{memory_id}", response_model=bool)
-async def delete_memory_by_id(memory_id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)):
-    result = Memories.delete_memory_by_id_and_user_id(memory_id, user.id, db=db)
+async def delete_memory_by_id(memory_id: str, user=Depends(get_verified_user)):
+    result = Memories.delete_memory_by_id_and_user_id(memory_id, user.id)
 
     if result:
         VECTOR_DB_CLIENT.delete(

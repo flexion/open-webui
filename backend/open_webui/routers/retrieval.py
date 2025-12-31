@@ -39,8 +39,6 @@ from langchain_core.documents import Document
 from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.models.knowledge import Knowledges
 from open_webui.storage.provider import Storage
-from open_webui.internal.db import get_session
-from sqlalchemy.orm import Session
 
 
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
@@ -1486,15 +1484,14 @@ def process_file(
     request: Request,
     form_data: ProcessFileForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
     """
     Process a file and save its content to the vector database.
     """
     if user.role == "admin":
-        file = Files.get_file_by_id(form_data.file_id, db=db)
+        file = Files.get_file_by_id(form_data.file_id)
     else:
-        file = Files.get_file_by_id_and_user_id(form_data.file_id, user.id, db=db)
+        file = Files.get_file_by_id_and_user_id(form_data.file_id, user.id)
 
     if file:
         try:
@@ -1636,13 +1633,12 @@ def process_file(
             Files.update_file_data_by_id(
                 file.id,
                 {"content": text_content},
-                db=db,
             )
             hash = calculate_sha256_string(text_content)
-            Files.update_file_hash_by_id(file.id, hash, db=db)
+            Files.update_file_hash_by_id(file.id, hash)
 
             if request.app.state.config.BYPASS_EMBEDDING_AND_RETRIEVAL:
-                Files.update_file_data_by_id(file.id, {"status": "completed"}, db=db)
+                Files.update_file_data_by_id(file.id, {"status": "completed"})
                 return {
                     "status": True,
                     "collection_name": None,
@@ -1671,13 +1667,11 @@ def process_file(
                             {
                                 "collection_name": collection_name,
                             },
-                            db=db,
                         )
 
                         Files.update_file_data_by_id(
                             file.id,
                             {"status": "completed"},
-                            db=db,
                         )
 
                         return {
@@ -1696,7 +1690,6 @@ def process_file(
             Files.update_file_data_by_id(
                 file.id,
                 {"status": "failed"},
-                db=db,
             )
 
             if "No pandoc was found" in str(e):
@@ -2424,10 +2417,10 @@ class DeleteForm(BaseModel):
 
 
 @router.post("/delete")
-def delete_entries_from_collection(form_data: DeleteForm, user=Depends(get_admin_user), db: Session = Depends(get_session)):
+def delete_entries_from_collection(form_data: DeleteForm, user=Depends(get_admin_user)):
     try:
         if VECTOR_DB_CLIENT.has_collection(collection_name=form_data.collection_name):
-            file = Files.get_file_by_id(form_data.file_id, db=db)
+            file = Files.get_file_by_id(form_data.file_id)
             hash = file.hash
 
             VECTOR_DB_CLIENT.delete(
@@ -2443,9 +2436,9 @@ def delete_entries_from_collection(form_data: DeleteForm, user=Depends(get_admin
 
 
 @router.post("/reset/db")
-def reset_vector_db(user=Depends(get_admin_user), db: Session = Depends(get_session)):
+def reset_vector_db(user=Depends(get_admin_user)):
     VECTOR_DB_CLIENT.reset()
-    Knowledges.delete_all_knowledge(db=db)
+    Knowledges.delete_all_knowledge()
 
 
 @router.post("/reset/uploads")
@@ -2503,7 +2496,6 @@ async def process_files_batch(
     request: Request,
     form_data: BatchProcessFilesForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ) -> BatchProcessFilesResponse:
     """
     Process a batch of files and save them to the vector database.
@@ -2566,7 +2558,7 @@ async def process_files_batch(
 
             # Update all files with collection name
             for file_update, file_result in zip(file_updates, file_results):
-                Files.update_file_by_id(id=file_result.file_id, form_data=file_update, db=db)
+                Files.update_file_by_id(id=file_result.file_id, form_data=file_update)
                 file_result.status = "completed"
 
         except Exception as e:

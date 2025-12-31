@@ -1,11 +1,9 @@
-
 import json
 import time
 import uuid
 from typing import Optional
 
-from sqlalchemy.orm import Session
-from open_webui.internal.db import Base, JSONField, get_db, get_db_context
+from open_webui.internal.db import Base, get_db
 from open_webui.models.groups import Groups
 
 from pydantic import BaseModel, ConfigDict
@@ -306,9 +304,9 @@ class ChannelTable:
         return memberships
 
     def insert_new_channel(
-        self, form_data: CreateChannelForm, user_id: str, db: Optional[Session] = None
+        self, form_data: CreateChannelForm, user_id: str
     ) -> Optional[ChannelModel]:
-        with get_db_context(db) as db:
+        with get_db() as db:
             channel = ChannelModel(
                 **{
                     **form_data.model_dump(),
@@ -339,8 +337,8 @@ class ChannelTable:
             db.commit()
             return channel
 
-    def get_channels(self, db: Optional[Session] = None) -> list[ChannelModel]:
-        with get_db_context(db) as db:
+    def get_channels(self) -> list[ChannelModel]:
+        with get_db() as db:
             channels = db.query(Channel).all()
             return [ChannelModel.model_validate(channel) for channel in channels]
 
@@ -386,10 +384,10 @@ class ChannelTable:
 
         return query
 
-    def get_channels_by_user_id(self, user_id: str, db: Optional[Session] = None) -> list[ChannelModel]:
-        with get_db_context(db) as db:
+    def get_channels_by_user_id(self, user_id: str) -> list[ChannelModel]:
+        with get_db() as db:
             user_group_ids = [
-                group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
+                group.id for group in Groups.get_groups_by_member_id(user_id)
             ]
 
             membership_channels = (
@@ -423,8 +421,8 @@ class ChannelTable:
             all_channels = membership_channels + standard_channels
             return [ChannelModel.model_validate(c) for c in all_channels]
 
-    def get_dm_channel_by_user_ids(self, user_ids: list[str], db: Optional[Session] = None) -> Optional[ChannelModel]:
-        with get_db_context(db) as db:
+    def get_dm_channel_by_user_ids(self, user_ids: list[str]) -> Optional[ChannelModel]:
+        with get_db() as db:
             # Ensure uniqueness in case a list with duplicates is passed
             unique_user_ids = list(set(user_ids))
 
@@ -462,9 +460,8 @@ class ChannelTable:
         invited_by: str,
         user_ids: Optional[list[str]] = None,
         group_ids: Optional[list[str]] = None,
-        db: Optional[Session] = None,
     ) -> list[ChannelMemberModel]:
-        with get_db_context(db) as db:
+        with get_db() as db:
             # 1. Collect all user_ids including groups + inviter
             requested_users = self._collect_unique_user_ids(
                 invited_by, user_ids, group_ids
@@ -497,9 +494,8 @@ class ChannelTable:
         self,
         channel_id: str,
         user_ids: list[str],
-        db: Optional[Session] = None,
     ) -> int:
-        with get_db_context(db) as db:
+        with get_db() as db:
             result = (
                 db.query(ChannelMember)
                 .filter(
@@ -511,8 +507,8 @@ class ChannelTable:
             db.commit()
             return result  # number of rows deleted
 
-    def is_user_channel_manager(self, channel_id: str, user_id: str, db: Optional[Session] = None) -> bool:
-        with get_db_context(db) as db:
+    def is_user_channel_manager(self, channel_id: str, user_id: str) -> bool:
+        with get_db() as db:
             # Check if the user is the creator of the channel
             # or has a 'manager' role in ChannelMember
             channel = db.query(Channel).filter(Channel.id == channel_id).first()
@@ -531,9 +527,9 @@ class ChannelTable:
             return membership is not None
 
     def join_channel(
-        self, channel_id: str, user_id: str, db: Optional[Session] = None
+        self, channel_id: str, user_id: str
     ) -> Optional[ChannelMemberModel]:
-        with get_db_context(db) as db:
+        with get_db() as db:
             # Check if the membership already exists
             existing_membership = (
                 db.query(ChannelMember)
@@ -569,8 +565,8 @@ class ChannelTable:
             db.commit()
             return channel_member
 
-    def leave_channel(self, channel_id: str, user_id: str, db: Optional[Session] = None) -> bool:
-        with get_db_context(db) as db:
+    def leave_channel(self, channel_id: str, user_id: str) -> bool:
+        with get_db() as db:
             membership = (
                 db.query(ChannelMember)
                 .filter(
@@ -591,9 +587,9 @@ class ChannelTable:
             return True
 
     def get_member_by_channel_and_user_id(
-        self, channel_id: str, user_id: str, db: Optional[Session] = None
+        self, channel_id: str, user_id: str
     ) -> Optional[ChannelMemberModel]:
-        with get_db_context(db) as db:
+        with get_db() as db:
             membership = (
                 db.query(ChannelMember)
                 .filter(
@@ -604,8 +600,8 @@ class ChannelTable:
             )
             return ChannelMemberModel.model_validate(membership) if membership else None
 
-    def get_members_by_channel_id(self, channel_id: str, db: Optional[Session] = None) -> list[ChannelMemberModel]:
-        with get_db_context(db) as db:
+    def get_members_by_channel_id(self, channel_id: str) -> list[ChannelMemberModel]:
+        with get_db() as db:
             memberships = (
                 db.query(ChannelMember)
                 .filter(ChannelMember.channel_id == channel_id)
@@ -616,8 +612,8 @@ class ChannelTable:
                 for membership in memberships
             ]
 
-    def pin_channel(self, channel_id: str, user_id: str, is_pinned: bool, db: Optional[Session] = None) -> bool:
-        with get_db_context(db) as db:
+    def pin_channel(self, channel_id: str, user_id: str, is_pinned: bool) -> bool:
+        with get_db() as db:
             membership = (
                 db.query(ChannelMember)
                 .filter(
@@ -635,8 +631,8 @@ class ChannelTable:
             db.commit()
             return True
 
-    def update_member_last_read_at(self, channel_id: str, user_id: str, db: Optional[Session] = None) -> bool:
-        with get_db_context(db) as db:
+    def update_member_last_read_at(self, channel_id: str, user_id: str) -> bool:
+        with get_db() as db:
             membership = (
                 db.query(ChannelMember)
                 .filter(
@@ -655,9 +651,9 @@ class ChannelTable:
             return True
 
     def update_member_active_status(
-        self, channel_id: str, user_id: str, is_active: bool, db: Optional[Session] = None
+        self, channel_id: str, user_id: str, is_active: bool
     ) -> bool:
-        with get_db_context(db) as db:
+        with get_db() as db:
             membership = (
                 db.query(ChannelMember)
                 .filter(
@@ -675,8 +671,8 @@ class ChannelTable:
             db.commit()
             return True
 
-    def is_user_channel_member(self, channel_id: str, user_id: str, db: Optional[Session] = None) -> bool:
-        with get_db_context(db) as db:
+    def is_user_channel_member(self, channel_id: str, user_id: str) -> bool:
+        with get_db() as db:
             membership = (
                 db.query(ChannelMember)
                 .filter(
@@ -687,16 +683,13 @@ class ChannelTable:
             )
             return membership is not None
 
-    def get_channel_by_id(self, id: str, db: Optional[Session] = None) -> Optional[ChannelModel]:
-        try:
-            with get_db_context(db) as db:
-                channel = db.query(Channel).filter(Channel.id == id).first()
-                return ChannelModel.model_validate(channel) if channel else None
-        except Exception:
-            return None
+    def get_channel_by_id(self, id: str) -> Optional[ChannelModel]:
+        with get_db() as db:
+            channel = db.query(Channel).filter(Channel.id == id).first()
+            return ChannelModel.model_validate(channel) if channel else None
 
-    def get_channels_by_file_id(self, file_id: str, db: Optional[Session] = None) -> list[ChannelModel]:
-        with get_db_context(db) as db:
+    def get_channels_by_file_id(self, file_id: str) -> list[ChannelModel]:
+        with get_db() as db:
             channel_files = (
                 db.query(ChannelFile).filter(ChannelFile.file_id == file_id).all()
             )
@@ -705,9 +698,9 @@ class ChannelTable:
             return [ChannelModel.model_validate(channel) for channel in channels]
 
     def get_channels_by_file_id_and_user_id(
-        self, file_id: str, user_id: str, db: Optional[Session] = None
+        self, file_id: str, user_id: str
     ) -> list[ChannelModel]:
-        with get_db_context(db) as db:
+        with get_db() as db:
             # 1. Determine which channels have this file
             channel_file_rows = (
                 db.query(ChannelFile).filter(ChannelFile.file_id == file_id).all()
@@ -731,7 +724,7 @@ class ChannelTable:
                 return []
 
             # Preload user's group membership
-            user_group_ids = [g.id for g in Groups.get_groups_by_member_id(user_id, db=db)]
+            user_group_ids = [g.id for g in Groups.get_groups_by_member_id(user_id)]
 
             allowed_channels = []
 
@@ -768,9 +761,9 @@ class ChannelTable:
             return allowed_channels
 
     def get_channel_by_id_and_user_id(
-        self, id: str, user_id: str, db: Optional[Session] = None
+        self, id: str, user_id: str
     ) -> Optional[ChannelModel]:
-        with get_db_context(db) as db:
+        with get_db() as db:
             # Fetch the channel
             channel: Channel = (
                 db.query(Channel)
@@ -806,7 +799,7 @@ class ChannelTable:
 
             # Determine user groups
             user_group_ids = [
-                group.id for group in Groups.get_groups_by_member_id(user_id, db=db)
+                group.id for group in Groups.get_groups_by_member_id(user_id)
             ]
 
             # Apply ACL rules

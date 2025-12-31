@@ -15,8 +15,6 @@ from open_webui.models.feedbacks import (
 
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.internal.db import get_session
-from sqlalchemy.orm import Session
 
 router = APIRouter()
 
@@ -62,50 +60,38 @@ async def update_config(
 
 
 @router.get("/feedbacks/all", response_model=list[FeedbackResponse])
-async def get_all_feedbacks(
-    user=Depends(get_admin_user), db: Session = Depends(get_session)
-):
-    feedbacks = Feedbacks.get_all_feedbacks(db=db)
+async def get_all_feedbacks(user=Depends(get_admin_user)):
+    feedbacks = Feedbacks.get_all_feedbacks()
     return feedbacks
 
 
 @router.get("/feedbacks/all/ids", response_model=list[FeedbackIdResponse])
-async def get_all_feedback_ids(
-    user=Depends(get_admin_user), db: Session = Depends(get_session)
-):
-    feedbacks = Feedbacks.get_all_feedbacks(db=db)
+async def get_all_feedback_ids(user=Depends(get_admin_user)):
+    feedbacks = Feedbacks.get_all_feedbacks()
     return feedbacks
 
 
 @router.delete("/feedbacks/all")
-async def delete_all_feedbacks(
-    user=Depends(get_admin_user), db: Session = Depends(get_session)
-):
-    success = Feedbacks.delete_all_feedbacks(db=db)
+async def delete_all_feedbacks(user=Depends(get_admin_user)):
+    success = Feedbacks.delete_all_feedbacks()
     return success
 
 
 @router.get("/feedbacks/all/export", response_model=list[FeedbackModel])
-async def export_all_feedbacks(
-    user=Depends(get_admin_user), db: Session = Depends(get_session)
-):
-    feedbacks = Feedbacks.get_all_feedbacks(db=db)
+async def export_all_feedbacks(user=Depends(get_admin_user)):
+    feedbacks = Feedbacks.get_all_feedbacks()
     return feedbacks
 
 
 @router.get("/feedbacks/user", response_model=list[FeedbackUserResponse])
-async def get_feedbacks(
-    user=Depends(get_verified_user), db: Session = Depends(get_session)
-):
-    feedbacks = Feedbacks.get_feedbacks_by_user_id(user.id, db=db)
+async def get_feedbacks(user=Depends(get_verified_user)):
+    feedbacks = Feedbacks.get_feedbacks_by_user_id(user.id)
     return feedbacks
 
 
 @router.delete("/feedbacks", response_model=bool)
-async def delete_feedbacks(
-    user=Depends(get_verified_user), db: Session = Depends(get_session)
-):
-    success = Feedbacks.delete_feedbacks_by_user_id(user.id, db=db)
+async def delete_feedbacks(user=Depends(get_verified_user)):
+    success = Feedbacks.delete_feedbacks_by_user_id(user.id)
     return success
 
 
@@ -118,7 +104,6 @@ async def get_feedbacks(
     direction: Optional[str] = None,
     page: Optional[int] = 1,
     user=Depends(get_admin_user),
-    db: Session = Depends(get_session),
 ):
     limit = PAGE_ITEM_COUNT
 
@@ -131,7 +116,7 @@ async def get_feedbacks(
     if direction:
         filter["direction"] = direction
 
-    result = Feedbacks.get_feedback_items(filter=filter, skip=skip, limit=limit, db=db)
+    result = Feedbacks.get_feedback_items(filter=filter, skip=skip, limit=limit)
     return result
 
 
@@ -140,11 +125,8 @@ async def create_feedback(
     request: Request,
     form_data: FeedbackForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
-    feedback = Feedbacks.insert_new_feedback(
-        user_id=user.id, form_data=form_data, db=db
-    )
+    feedback = Feedbacks.insert_new_feedback(user_id=user.id, form_data=form_data)
     if not feedback:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -155,15 +137,11 @@ async def create_feedback(
 
 
 @router.get("/feedback/{id}", response_model=FeedbackModel)
-async def get_feedback_by_id(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
-):
+async def get_feedback_by_id(id: str, user=Depends(get_verified_user)):
     if user.role == "admin":
-        feedback = Feedbacks.get_feedback_by_id(id=id, db=db)
+        feedback = Feedbacks.get_feedback_by_id(id=id)
     else:
-        feedback = Feedbacks.get_feedback_by_id_and_user_id(
-            id=id, user_id=user.id, db=db
-        )
+        feedback = Feedbacks.get_feedback_by_id_and_user_id(id=id, user_id=user.id)
 
     if not feedback:
         raise HTTPException(
@@ -175,16 +153,13 @@ async def get_feedback_by_id(
 
 @router.post("/feedback/{id}", response_model=FeedbackModel)
 async def update_feedback_by_id(
-    id: str,
-    form_data: FeedbackForm,
-    user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
+    id: str, form_data: FeedbackForm, user=Depends(get_verified_user)
 ):
     if user.role == "admin":
-        feedback = Feedbacks.update_feedback_by_id(id=id, form_data=form_data, db=db)
+        feedback = Feedbacks.update_feedback_by_id(id=id, form_data=form_data)
     else:
         feedback = Feedbacks.update_feedback_by_id_and_user_id(
-            id=id, user_id=user.id, form_data=form_data, db=db
+            id=id, user_id=user.id, form_data=form_data
         )
 
     if not feedback:
@@ -196,15 +171,11 @@ async def update_feedback_by_id(
 
 
 @router.delete("/feedback/{id}")
-async def delete_feedback_by_id(
-    id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
-):
+async def delete_feedback_by_id(id: str, user=Depends(get_verified_user)):
     if user.role == "admin":
-        success = Feedbacks.delete_feedback_by_id(id=id, db=db)
+        success = Feedbacks.delete_feedback_by_id(id=id)
     else:
-        success = Feedbacks.delete_feedback_by_id_and_user_id(
-            id=id, user_id=user.id, db=db
-        )
+        success = Feedbacks.delete_feedback_by_id_and_user_id(id=id, user_id=user.id)
 
     if not success:
         raise HTTPException(

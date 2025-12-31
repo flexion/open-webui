@@ -38,9 +38,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, validator
 from starlette.background import BackgroundTask
-from sqlalchemy.orm import Session
-
-from open_webui.internal.db import get_session
 
 
 from open_webui.models.models import Models
@@ -424,14 +421,14 @@ async def get_all_models(request: Request, user: UserModel = None):
     return models
 
 
-async def get_filtered_models(models, user, db=None):
+async def get_filtered_models(models, user):
     # Filter models based on user access control
     filtered_models = []
     for model in models.get("models", []):
-        model_info = Models.get_model_by_id(model["model"], db=db)
+        model_info = Models.get_model_by_id(model["model"])
         if model_info:
             if user.id == model_info.user_id or has_access(
-                user.id, type="read", access_control=model_info.access_control, db=db
+                user.id, type="read", access_control=model_info.access_control
             ):
                 filtered_models.append(model)
     return filtered_models
@@ -1256,7 +1253,6 @@ async def generate_chat_completion(
     url_idx: Optional[int] = None,
     user=Depends(get_verified_user),
     bypass_filter: Optional[bool] = False,
-    db: Session = Depends(get_session),
 ):
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
@@ -1278,7 +1274,7 @@ async def generate_chat_completion(
         del payload["metadata"]
 
     model_id = payload["model"]
-    model_info = Models.get_model_by_id(model_id, db=db)
+    model_info = Models.get_model_by_id(model_id)
 
     if model_info:
         if model_info.base_model_id:
@@ -1302,7 +1298,7 @@ async def generate_chat_completion(
             if not (
                 user.id == model_info.user_id
                 or has_access(
-                    user.id, type="read", access_control=model_info.access_control, db=db
+                    user.id, type="read", access_control=model_info.access_control
                 )
             ):
                 raise HTTPException(
@@ -1374,7 +1370,6 @@ async def generate_openai_completion(
     form_data: dict,
     url_idx: Optional[int] = None,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
     metadata = form_data.pop("metadata", None)
 
@@ -1395,7 +1390,7 @@ async def generate_openai_completion(
     if ":" not in model_id:
         model_id = f"{model_id}:latest"
 
-    model_info = Models.get_model_by_id(model_id, db=db)
+    model_info = Models.get_model_by_id(model_id)
     if model_info:
         if model_info.base_model_id:
             payload["model"] = model_info.base_model_id
@@ -1409,7 +1404,7 @@ async def generate_openai_completion(
             if not (
                 user.id == model_info.user_id
                 or has_access(
-                    user.id, type="read", access_control=model_info.access_control, db=db
+                    user.id, type="read", access_control=model_info.access_control
                 )
             ):
                 raise HTTPException(
@@ -1454,7 +1449,6 @@ async def generate_openai_chat_completion(
     form_data: dict,
     url_idx: Optional[int] = None,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
     metadata = form_data.pop("metadata", None)
 
@@ -1475,7 +1469,7 @@ async def generate_openai_chat_completion(
     if ":" not in model_id:
         model_id = f"{model_id}:latest"
 
-    model_info = Models.get_model_by_id(model_id, db=db)
+    model_info = Models.get_model_by_id(model_id)
     if model_info:
         if model_info.base_model_id:
             payload["model"] = model_info.base_model_id
@@ -1493,7 +1487,7 @@ async def generate_openai_chat_completion(
             if not (
                 user.id == model_info.user_id
                 or has_access(
-                    user.id, type="read", access_control=model_info.access_control, db=db
+                    user.id, type="read", access_control=model_info.access_control
                 )
             ):
                 raise HTTPException(
@@ -1536,7 +1530,6 @@ async def get_openai_models(
     request: Request,
     url_idx: Optional[int] = None,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ):
 
     models = []
@@ -1589,10 +1582,10 @@ async def get_openai_models(
         # Filter models based on user access control
         filtered_models = []
         for model in models:
-            model_info = Models.get_model_by_id(model["id"], db=db)
+            model_info = Models.get_model_by_id(model["id"])
             if model_info:
                 if user.id == model_info.user_id or has_access(
-                    user.id, type="read", access_control=model_info.access_control, db=db
+                    user.id, type="read", access_control=model_info.access_control
                 ):
                     filtered_models.append(model)
         models = filtered_models
