@@ -39,7 +39,7 @@ from langchain_core.documents import Document
 from open_webui.models.files import FileModel, FileUpdateForm, Files
 from open_webui.models.knowledge import Knowledges
 from open_webui.storage.provider import Storage
-from open_webui.internal.db import get_session
+from open_webui.internal.db import get_session, get_db
 from sqlalchemy.orm import Session
 
 
@@ -468,6 +468,7 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
         # Content extraction settings
         "CONTENT_EXTRACTION_ENGINE": request.app.state.config.CONTENT_EXTRACTION_ENGINE,
         "PDF_EXTRACT_IMAGES": request.app.state.config.PDF_EXTRACT_IMAGES,
+        "PDF_LOADER_MODE": request.app.state.config.PDF_LOADER_MODE,
         "DATALAB_MARKER_API_KEY": request.app.state.config.DATALAB_MARKER_API_KEY,
         "DATALAB_MARKER_API_BASE_URL": request.app.state.config.DATALAB_MARKER_API_BASE_URL,
         "DATALAB_MARKER_ADDITIONAL_CONFIG": request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
@@ -659,6 +660,7 @@ class ConfigForm(BaseModel):
     # Content extraction settings
     CONTENT_EXTRACTION_ENGINE: Optional[str] = None
     PDF_EXTRACT_IMAGES: Optional[bool] = None
+    PDF_LOADER_MODE: Optional[str] = None
 
     DATALAB_MARKER_API_KEY: Optional[str] = None
     DATALAB_MARKER_API_BASE_URL: Optional[str] = None
@@ -785,6 +787,11 @@ async def update_rag_config(
         form_data.PDF_EXTRACT_IMAGES
         if form_data.PDF_EXTRACT_IMAGES is not None
         else request.app.state.config.PDF_EXTRACT_IMAGES
+    )
+    request.app.state.config.PDF_LOADER_MODE = (
+        form_data.PDF_LOADER_MODE
+        if form_data.PDF_LOADER_MODE is not None
+        else request.app.state.config.PDF_LOADER_MODE
     )
     request.app.state.config.DATALAB_MARKER_API_KEY = (
         form_data.DATALAB_MARKER_API_KEY
@@ -1180,6 +1187,7 @@ async def update_rag_config(
         # Content extraction settings
         "CONTENT_EXTRACTION_ENGINE": request.app.state.config.CONTENT_EXTRACTION_ENGINE,
         "PDF_EXTRACT_IMAGES": request.app.state.config.PDF_EXTRACT_IMAGES,
+        "PDF_LOADER_MODE": request.app.state.config.PDF_LOADER_MODE,
         "DATALAB_MARKER_API_KEY": request.app.state.config.DATALAB_MARKER_API_KEY,
         "DATALAB_MARKER_API_BASE_URL": request.app.state.config.DATALAB_MARKER_API_BASE_URL,
         "DATALAB_MARKER_ADDITIONAL_CONFIG": request.app.state.config.DATALAB_MARKER_ADDITIONAL_CONFIG,
@@ -1417,8 +1425,16 @@ def save_docs_to_vector_db(
         if result is not None and result.ids and len(result.ids) > 0:
             existing_doc_ids = result.ids[0]
             if existing_doc_ids:
-                log.info(f"Document with hash {metadata['hash']} already exists")
-                raise ValueError(ERROR_MESSAGES.DUPLICATE_CONTENT)
+                # Check if the existing document belongs to the same file
+                # If same file_id, this is a re-add/reindex - allow it
+                # If different file_id, this is a duplicate - block it
+                existing_file_id = None
+                if result.metadatas and result.metadatas[0]:
+                    existing_file_id = result.metadatas[0][0].get("file_id")
+
+                if existing_file_id != metadata.get("file_id"):
+                    log.info(f"Document with hash {metadata['hash']} already exists")
+                    raise ValueError(ERROR_MESSAGES.DUPLICATE_CONTENT)
 
     if split:
         if request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER:
@@ -1586,6 +1602,9 @@ def process_file(
 ):
     """
     Process a file and save its content to the vector database.
+    Process a file and save its content to the vector database.
+    Note: granular session management is used to prevent connection pool exhaustion.
+    The session is committed before external API calls, and updates use a fresh session.
     """
     if user.role == "admin":
         file = Files.get_file_by_id(form_data.file_id, db=db)
@@ -1747,6 +1766,13 @@ def process_file(
                 }
             else:
                 try:
+                    # Release the database connection relative to the 'file' object
+                    # to prevent holding the connection during the slow embedding step.
+                    db.expunge(file)
+                    db.commit()
+
+                    # External embedding API takes time (5-60s+).
+                    # No DB connection is held here.
                     result = save_docs_to_vector_db(
                         request,
                         docs=docs,
@@ -1762,27 +1788,29 @@ def process_file(
                     log.info(f"added {len(docs)} items to collection {collection_name}")
 
                     if result:
-                        Files.update_file_metadata_by_id(
-                            file.id,
-                            {
+                        # Fresh session for the final update.
+                        with get_db() as session:
+                            Files.update_file_metadata_by_id(
+                                file.id,
+                                {
+                                    "collection_name": collection_name,
+                                },
+                                db=session,
+                            )
+
+                            Files.update_file_data_by_id(
+                                file.id,
+                                {"status": "completed"},
+                                db=session,
+                            )
+                            Files.update_file_hash_by_id(file.id, hash, db=session)
+
+                            return {
+                                "status": True,
                                 "collection_name": collection_name,
-                            },
-                            db=db,
-                        )
-
-                        Files.update_file_data_by_id(
-                            file.id,
-                            {"status": "completed"},
-                            db=db,
-                        )
-                        Files.update_file_hash_by_id(file.id, hash, db=db)
-
-                        return {
-                            "status": True,
-                            "collection_name": collection_name,
-                            "filename": file.filename,
-                            "content": text_content,
-                        }
+                                "filename": file.filename,
+                                "content": text_content,
+                            }
                     else:
                         raise Exception("Error saving document to vector database")
                 except Exception as e:
@@ -1790,13 +1818,15 @@ def process_file(
 
         except Exception as e:
             log.exception(e)
-            Files.update_file_data_by_id(
-                file.id,
-                {"status": "failed"},
-                db=db,
-            )
-            # Clear the hash so the file can be re-uploaded after fixing the issue
-            Files.update_file_hash_by_id(file.id, None, db=db)
+            # Fresh session for error status update.
+            with get_db() as session:
+                Files.update_file_data_by_id(
+                    file.id,
+                    {"status": "failed"},
+                    db=session,
+                )
+                # Clear the hash so the file can be re-uploaded after fixing the issue
+                Files.update_file_hash_by_id(file.id, None, db=session)
 
             if "No pandoc was found" in str(e):
                 raise HTTPException(
@@ -2626,10 +2656,14 @@ async def process_files_batch(
     request: Request,
     form_data: BatchProcessFilesForm,
     user=Depends(get_verified_user),
-    db: Session = Depends(get_session),
 ) -> BatchProcessFilesResponse:
     """
     Process a batch of files and save them to the vector database.
+
+    NOTE: We intentionally do NOT use Depends(get_session) here.
+    The save_docs_to_vector_db() call makes external embedding API calls which
+    can take 5-60+ seconds for batch operations. Database operations after
+    embedding (Files.update_file_by_id) manage their own short-lived sessions.
     """
 
     collection_name = form_data.collection_name
@@ -2689,9 +2723,7 @@ async def process_files_batch(
 
             # Update all files with collection name
             for file_update, file_result in zip(file_updates, file_results):
-                Files.update_file_by_id(
-                    id=file_result.file_id, form_data=file_update, db=db
-                )
+                Files.update_file_by_id(id=file_result.file_id, form_data=file_update)
                 file_result.status = "completed"
 
         except Exception as e:
@@ -2701,7 +2733,9 @@ async def process_files_batch(
             for file_result in file_results:
                 file_result.status = "failed"
                 file_errors.append(
-                    BatchProcessFilesResult(file_id=file_result.file_id, error=str(e))
+                    BatchProcessFilesResult(
+                        file_id=file_result.file_id, status="failed", error=str(e)
+                    )
                 )
 
     return BatchProcessFilesResponse(results=file_results, errors=file_errors)

@@ -286,6 +286,7 @@ from open_webui.config import (
     ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER,
     TIKTOKEN_ENCODING_NAME,
     PDF_EXTRACT_IMAGES,
+    PDF_LOADER_MODE,
     YOUTUBE_LOADER_LANGUAGE,
     YOUTUBE_LOADER_PROXY_URL,
     # Retrieval (Web Search)
@@ -488,6 +489,7 @@ from open_webui.env import (
     WEBUI_ADMIN_EMAIL,
     WEBUI_ADMIN_PASSWORD,
     WEBUI_ADMIN_NAME,
+    ENABLE_EASTER_EGGS,
 )
 
 
@@ -942,6 +944,7 @@ app.state.config.RAG_OLLAMA_BASE_URL = RAG_OLLAMA_BASE_URL
 app.state.config.RAG_OLLAMA_API_KEY = RAG_OLLAMA_API_KEY
 
 app.state.config.PDF_EXTRACT_IMAGES = PDF_EXTRACT_IMAGES
+app.state.config.PDF_LOADER_MODE = PDF_LOADER_MODE
 
 app.state.config.YOUTUBE_LOADER_LANGUAGE = YOUTUBE_LOADER_LANGUAGE
 app.state.config.YOUTUBE_LOADER_PROXY_URL = YOUTUBE_LOADER_PROXY_URL
@@ -1928,6 +1931,7 @@ async def get_app_config(request: Request):
             "enable_websocket": ENABLE_WEBSOCKET_SUPPORT,
             "enable_version_update_check": ENABLE_VERSION_UPDATE_CHECK,
             "enable_public_active_users_count": ENABLE_PUBLIC_ACTIVE_USERS_COUNT,
+            "enable_easter_eggs": ENABLE_EASTER_EGGS,
             **(
                 {
                     "enable_direct_connections": app.state.config.ENABLE_DIRECT_CONNECTIONS,
