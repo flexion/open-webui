@@ -40,95 +40,71 @@ log = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Mapping of model ID prefixes to provider icon filenames
-# Order matters - more specific prefixes should come first
-MODEL_PROVIDER_PREFIXES = [
-    # Anthropic Claude models
-    ("anthropic.claude", "anthropic"),
-    ("us.anthropic.claude", "anthropic"),
-    ("eu.anthropic.claude", "anthropic"),
-    ("global.anthropic.claude", "anthropic"),
-    ("anthropic.", "anthropic"),
-    ("us.anthropic.", "anthropic"),
-    ("eu.anthropic.", "anthropic"),
-    ("global.anthropic.", "anthropic"),
-    # Meta Llama models
-    ("meta.llama", "meta"),
-    ("us.meta.llama", "meta"),
-    ("meta.", "meta"),
-    ("us.meta.", "meta"),
-    # Mistral models
-    ("mistral.mistral-large", "mistral"),
-    ("mistral.mistral-small", "mistral"),
-    ("mistral.mixtral", "mistral"),
-    ("mistral.mistral", "mistral"),
-    ("mistral.voxtral", "mistral"),
-    ("mistral.ministral", "mistral"),
-    ("mistral.magistral", "mistral"),
-    ("mistral.pixtral", "mistral"),
-    ("mistral.", "mistral"),
-    # Amazon models
-    ("amazon.titan", "amazon"),
-    ("amazon.nova", "amazon"),
-    ("us.amazon.nova", "amazon"),
-    ("global.amazon.nova", "amazon"),
-    ("amazon.", "amazon"),
-    ("us.amazon.", "amazon"),
-    ("global.amazon.", "amazon"),
-    # Cohere models
-    ("cohere.command-r-plus", "cohere"),
-    ("cohere.command-r", "cohere"),
-    ("cohere.command", "cohere"),
-    ("cohere.embed", "cohere"),
-    ("cohere.", "cohere"),
-    # AI21 models
-    ("ai21.jamba", "ai21"),
-    ("ai21.j2", "ai21"),
-    ("ai21.", "ai21"),
-    # DeepSeek models
-    ("deepseek.", "deepseek"),
-    ("deepseek", "deepseek"),
-    # Stability AI models
-    ("stability.", "stability"),
-    ("stability", "stability"),
-    # Google models
-    ("google.gemma", "google"),
-    ("google.", "google"),
-    # OpenAI GPT models
-    ("openai.gpt", "openai"),
-    ("openai.", "openai"),
-    ("gpt-", "openai"),
-    # Nvidia models
-    ("nvidia.nemotron-nano", "nvidia"),
-    ("nvidia.nemotron", "nvidia"),
-    ("nvidia.", "nvidia"),
-    # Qwen models
-    ("qwen.qwen", "qwen"),
-    ("qwen.", "qwen"),
-    # Minimax models
-    ("minimax.minimax", "minimax"),
-    ("minimax.", "minimax"),
-    # Moonshot models
-    ("moonshot.kimi", "moonshot"),
-    ("moonshot.", "moonshot"),
-    # Twelve Labs models
-    ("twelvelabs.pegasus", "twelvelabs"),
-    ("twelvelabs.", "twelvelabs"),
-    # Writer models
-    ("writer.palmyra", "writer"),
-    ("writer.", "writer"),
-]
+# Provider icon configuration is loaded from providers.json for easier maintenance
+# See static/static/providers/providers.json for the configuration
+_PROVIDER_CONFIG = None
+_PROVIDER_CONFIG_PATH = f"{STATIC_DIR}/providers/providers.json"
+
+
+def _load_provider_config() -> dict:
+    """Load provider icon configuration from JSON file."""
+    global _PROVIDER_CONFIG
+    if _PROVIDER_CONFIG is None:
+        try:
+            with open(_PROVIDER_CONFIG_PATH, "r") as f:
+                _PROVIDER_CONFIG = json.load(f)
+        except Exception as e:
+            log.warning(f"Failed to load provider config: {e}")
+            _PROVIDER_CONFIG = {
+                "providers": {},
+                "region_prefixes": [],
+                "model_prefix_aliases": {},
+            }
+    return _PROVIDER_CONFIG
+
+
+def get_provider_from_model_id(model_id: str) -> Optional[str]:
+    """
+    Extract the provider name from a model ID.
+
+    Examples:
+        'anthropic.claude-3-sonnet' → 'anthropic'
+        'us.anthropic.claude-3-sonnet' → 'anthropic'
+        'gpt-4o' → 'openai' (via alias)
+    """
+    config = _load_provider_config()
+    model_id_lower = model_id.lower()
+
+    # Check for special aliases first (e.g., 'gpt-' → 'openai')
+    for alias, provider in config.get("model_prefix_aliases", {}).items():
+        if model_id_lower.startswith(alias.lower()):
+            return provider
+
+    # Strip known region prefixes (us., eu., global., apac.)
+    for prefix in config.get("region_prefixes", []):
+        if model_id_lower.startswith(prefix.lower()):
+            model_id_lower = model_id_lower[len(prefix) :]
+            break
+
+    # Extract provider from first segment (before the first dot)
+    if "." in model_id_lower:
+        return model_id_lower.split(".")[0]
+
+    return None
 
 
 def get_provider_icon_path(model_id: str) -> Optional[str]:
     """
-    Returns the path to a provider-specific icon based on model ID prefix.
-    Returns None if no matching provider is found.
+    Returns the path to a provider-specific icon based on model ID.
+    Returns None if no matching provider icon is found.
     """
-    model_id_lower = model_id.lower()
-    for prefix, provider in MODEL_PROVIDER_PREFIXES:
-        if model_id_lower.startswith(prefix.lower()):
-            return f"{STATIC_DIR}/providers/{provider}.png"
+    config = _load_provider_config()
+    provider = get_provider_from_model_id(model_id)
+
+    if provider and provider in config.get("providers", {}):
+        icon_filename = config["providers"][provider]
+        return f"{STATIC_DIR}/providers/{icon_filename}"
+
     return None
 
 
