@@ -90,6 +90,9 @@ ENABLE_OLLAMA_API=false
 DEFAULT_USER_ROLE=user
 ENABLE_API_KEYS=true
 USER_PERMISSIONS_FEATURES_API_KEYS=true
+
+
+WEBUI_AUTH=false 
 ```
 
 ### Step 3: Run FlexChat with Docker Compose
