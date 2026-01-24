@@ -1,0 +1,34 @@
+{
+  "_comment": "Maps provider names to icon filenames. The provider name is extracted from model IDs automatically.",
+  "_usage": "Model ID 'us.anthropic.claude-3-sonnet' → extracts 'anthropic' → uses 'anthropic.png'",
+
+  "providers": {
+    "anthropic": "anthropic.png",
+    "meta": "meta.png",
+    "mistral": "mistral.png",
+    "amazon": "amazon.png",
+    "cohere": "cohere.png",
+    "ai21": "ai21.png",
+    "deepseek": "deepseek.png",
+    "stability": "stability.png",
+    "google": "google.png",
+    "openai": "openai.png",
+    "nvidia": "nvidia.png",
+    "qwen": "qwen.png",
+    "minimax": "minimax.png",
+    "moonshot": "moonshot.png",
+    "twelvelabs": "twelvelabs.png",
+    "writer": "writer.png"
+  },
+
+  "region_prefixes": [
+    "us.",
+    "eu.",
+    "global.",
+    "apac."
+  ],
+
+  "model_prefix_aliases": {
+    "gpt-": "openai"
+  }
+}
