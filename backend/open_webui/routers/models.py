@@ -1,5 +1,6 @@
 from typing import Optional
 import io
+import os
 import base64
 import json
 import asyncio
@@ -38,6 +39,97 @@ from sqlalchemy.orm import Session
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Mapping of model ID prefixes to provider icon filenames
+# Order matters - more specific prefixes should come first
+MODEL_PROVIDER_PREFIXES = [
+    # Anthropic Claude models
+    ("anthropic.claude", "anthropic"),
+    ("us.anthropic.claude", "anthropic"),
+    ("eu.anthropic.claude", "anthropic"),
+    ("global.anthropic.claude", "anthropic"),
+    ("anthropic.", "anthropic"),
+    ("us.anthropic.", "anthropic"),
+    ("eu.anthropic.", "anthropic"),
+    ("global.anthropic.", "anthropic"),
+    # Meta Llama models
+    ("meta.llama", "meta"),
+    ("us.meta.llama", "meta"),
+    ("meta.", "meta"),
+    ("us.meta.", "meta"),
+    # Mistral models
+    ("mistral.mistral-large", "mistral"),
+    ("mistral.mistral-small", "mistral"),
+    ("mistral.mixtral", "mistral"),
+    ("mistral.mistral", "mistral"),
+    ("mistral.voxtral", "mistral"),
+    ("mistral.ministral", "mistral"),
+    ("mistral.magistral", "mistral"),
+    ("mistral.pixtral", "mistral"),
+    ("mistral.", "mistral"),
+    # Amazon models
+    ("amazon.titan", "amazon"),
+    ("amazon.nova", "amazon"),
+    ("us.amazon.nova", "amazon"),
+    ("global.amazon.nova", "amazon"),
+    ("amazon.", "amazon"),
+    ("us.amazon.", "amazon"),
+    ("global.amazon.", "amazon"),
+    # Cohere models
+    ("cohere.command-r-plus", "cohere"),
+    ("cohere.command-r", "cohere"),
+    ("cohere.command", "cohere"),
+    ("cohere.embed", "cohere"),
+    ("cohere.", "cohere"),
+    # AI21 models
+    ("ai21.jamba", "ai21"),
+    ("ai21.j2", "ai21"),
+    ("ai21.", "ai21"),
+    # DeepSeek models
+    ("deepseek.", "deepseek"),
+    ("deepseek", "deepseek"),
+    # Stability AI models
+    ("stability.", "stability"),
+    ("stability", "stability"),
+    # Google models
+    ("google.gemma", "google"),
+    ("google.", "google"),
+    # OpenAI GPT models
+    ("openai.gpt", "openai"),
+    ("openai.", "openai"),
+    ("gpt-", "openai"),
+    # Nvidia models
+    ("nvidia.nemotron-nano", "nvidia"),
+    ("nvidia.nemotron", "nvidia"),
+    ("nvidia.", "nvidia"),
+    # Qwen models
+    ("qwen.qwen", "qwen"),
+    ("qwen.", "qwen"),
+    # Minimax models
+    ("minimax.minimax", "minimax"),
+    ("minimax.", "minimax"),
+    # Moonshot models
+    ("moonshot.kimi", "moonshot"),
+    ("moonshot.", "moonshot"),
+    # Twelve Labs models
+    ("twelvelabs.pegasus", "twelvelabs"),
+    ("twelvelabs.", "twelvelabs"),
+    # Writer models
+    ("writer.palmyra", "writer"),
+    ("writer.", "writer"),
+]
+
+
+def get_provider_icon_path(model_id: str) -> Optional[str]:
+    """
+    Returns the path to a provider-specific icon based on model ID prefix.
+    Returns None if no matching provider is found.
+    """
+    model_id_lower = model_id.lower()
+    for prefix, provider in MODEL_PROVIDER_PREFIXES:
+        if model_id_lower.startswith(prefix.lower()):
+            return f"{STATIC_DIR}/providers/{provider}.png"
+    return None
 
 
 def is_valid_model_id(model_id: str) -> bool:
@@ -350,32 +442,43 @@ def get_model_profile_image(id: str, user=Depends(get_verified_user)):
         etag = f'"{model.updated_at}"' if model.updated_at else None
 
         if model.meta.profile_image_url:
-            if model.meta.profile_image_url.startswith("http"):
-                return Response(
-                    status_code=status.HTTP_302_FOUND,
-                    headers={"Location": model.meta.profile_image_url},
-                )
-            elif model.meta.profile_image_url.startswith("data:image"):
-                try:
-                    header, base64_data = model.meta.profile_image_url.split(",", 1)
-                    image_data = base64.b64decode(base64_data)
-                    image_buffer = io.BytesIO(image_data)
-                    media_type = header.split(";")[0].lstrip("data:")
-
-                    headers = {"Content-Disposition": "inline"}
-                    if etag:
-                        headers["ETag"] = etag
-
-                    return StreamingResponse(
-                        image_buffer,
-                        media_type=media_type,
-                        headers=headers,
+            # Check if it's NOT the default favicon (custom image was set)
+            if not model.meta.profile_image_url.endswith("/favicon.png"):
+                if model.meta.profile_image_url.startswith("http"):
+                    return Response(
+                        status_code=status.HTTP_302_FOUND,
+                        headers={"Location": model.meta.profile_image_url},
                     )
-                except Exception as e:
-                    pass
+                elif model.meta.profile_image_url.startswith("data:image"):
+                    try:
+                        header, base64_data = model.meta.profile_image_url.split(",", 1)
+                        image_data = base64.b64decode(base64_data)
+                        image_buffer = io.BytesIO(image_data)
+                        media_type = header.split(";")[0].lstrip("data:")
+
+                        headers = {"Content-Disposition": "inline"}
+                        if etag:
+                            headers["ETag"] = etag
+
+                        return StreamingResponse(
+                            image_buffer,
+                            media_type=media_type,
+                            headers=headers,
+                        )
+                    except Exception as e:
+                        pass
+
+        # Try to find a provider-specific icon based on model ID
+        provider_icon_path = get_provider_icon_path(id)
+        if provider_icon_path and os.path.exists(provider_icon_path):
+            return FileResponse(provider_icon_path, media_type="image/png")
 
         return FileResponse(f"{STATIC_DIR}/favicon.png")
     else:
+        # Model not found in database - check provider icon based on ID
+        provider_icon_path = get_provider_icon_path(id)
+        if provider_icon_path and os.path.exists(provider_icon_path):
+            return FileResponse(provider_icon_path, media_type="image/png")
         return FileResponse(f"{STATIC_DIR}/favicon.png")
 
 
