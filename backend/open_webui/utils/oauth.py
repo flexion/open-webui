@@ -1690,7 +1690,7 @@ class OAuthManager:
                 raise HTTPException(400, detail=ERROR_MESSAGES.INVALID_CRED)
 
             # Check if the user exists
-            user = Users.get_user_by_oauth_sub(provider_sub)
+            user = Users.get_user_by_oauth_sub(provider, sub, db=db)
 
             if not user:
                 # If the user does not exist, check if merging is enabled
@@ -1763,7 +1763,7 @@ class OAuthManager:
                     name=name,
                     profile_image_url=picture_url,
                     role=role,
-                    oauth_sub=provider_sub,
+                    oauth=oauth_data,
                     db=db
                 )
 
