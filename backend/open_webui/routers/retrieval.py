@@ -76,6 +76,7 @@ from open_webui.retrieval.web.perplexity import search_perplexity
 from open_webui.retrieval.web.sougou import search_sougou
 from open_webui.retrieval.web.firecrawl import search_firecrawl
 from open_webui.retrieval.web.external import search_external
+from open_webui.retrieval.web.yandex import search_yandex
 
 from open_webui.retrieval.utils import (
     get_content_from_url,
@@ -109,6 +110,7 @@ from open_webui.config import (
 from open_webui.env import (
     DEVICE_TYPE,
     DOCKER,
+    RAG_EMBEDDING_TIMEOUT,
     SENTENCE_TRANSFORMERS_BACKEND,
     SENTENCE_TRANSFORMERS_MODEL_KWARGS,
     SENTENCE_TRANSFORMERS_CROSS_ENCODER_BACKEND,
@@ -578,6 +580,9 @@ async def get_rag_config(request: Request, user=Depends(get_admin_user)):
             "YOUTUBE_LOADER_LANGUAGE": request.app.state.config.YOUTUBE_LOADER_LANGUAGE,
             "YOUTUBE_LOADER_PROXY_URL": request.app.state.config.YOUTUBE_LOADER_PROXY_URL,
             "YOUTUBE_LOADER_TRANSLATION": request.app.state.YOUTUBE_LOADER_TRANSLATION,
+            "YANDEX_WEB_SEARCH_URL": request.app.state.config.YANDEX_WEB_SEARCH_URL,
+            "YANDEX_WEB_SEARCH_API_KEY": request.app.state.config.YANDEX_WEB_SEARCH_API_KEY,
+            "YANDEX_WEB_SEARCH_CONFIG": request.app.state.config.YANDEX_WEB_SEARCH_CONFIG,
         },
     }
 
@@ -641,6 +646,9 @@ class WebConfig(BaseModel):
     YOUTUBE_LOADER_LANGUAGE: Optional[List[str]] = None
     YOUTUBE_LOADER_PROXY_URL: Optional[str] = None
     YOUTUBE_LOADER_TRANSLATION: Optional[str] = None
+    YANDEX_WEB_SEARCH_URL: Optional[str] = None
+    YANDEX_WEB_SEARCH_API_KEY: Optional[str] = None
+    YANDEX_WEB_SEARCH_CONFIG: Optional[str] = None
 
 
 class ConfigForm(BaseModel):
@@ -1013,6 +1021,11 @@ async def update_rag_config(
         if form_data.TEXT_SPLITTER is not None
         else request.app.state.config.TEXT_SPLITTER
     )
+    request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER = (
+        form_data.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER
+        if form_data.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER is not None
+        else request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER
+    )
     request.app.state.config.CHUNK_SIZE = (
         form_data.CHUNK_SIZE
         if form_data.CHUNK_SIZE is not None
@@ -1030,13 +1043,25 @@ async def update_rag_config(
     )
 
     # File upload settings
-    request.app.state.config.FILE_MAX_SIZE = form_data.FILE_MAX_SIZE
-    request.app.state.config.FILE_MAX_COUNT = form_data.FILE_MAX_COUNT
+    request.app.state.config.FILE_MAX_SIZE = (
+        form_data.FILE_MAX_SIZE
+        if form_data.FILE_MAX_SIZE is not None
+        else request.app.state.config.FILE_MAX_SIZE
+    )
+    request.app.state.config.FILE_MAX_COUNT = (
+        form_data.FILE_MAX_COUNT
+        if form_data.FILE_MAX_COUNT is not None
+        else request.app.state.config.FILE_MAX_COUNT
+    )
     request.app.state.config.FILE_IMAGE_COMPRESSION_WIDTH = (
         form_data.FILE_IMAGE_COMPRESSION_WIDTH
+        if form_data.FILE_IMAGE_COMPRESSION_WIDTH is not None
+        else request.app.state.config.FILE_IMAGE_COMPRESSION_WIDTH
     )
     request.app.state.config.FILE_IMAGE_COMPRESSION_HEIGHT = (
         form_data.FILE_IMAGE_COMPRESSION_HEIGHT
+        if form_data.FILE_IMAGE_COMPRESSION_HEIGHT is not None
+        else request.app.state.config.FILE_IMAGE_COMPRESSION_HEIGHT
     )
     request.app.state.config.ALLOWED_FILE_EXTENSIONS = (
         form_data.ALLOWED_FILE_EXTENSIONS
@@ -1171,6 +1196,15 @@ async def update_rag_config(
         request.app.state.YOUTUBE_LOADER_TRANSLATION = (
             form_data.web.YOUTUBE_LOADER_TRANSLATION
         )
+        request.app.state.config.YANDEX_WEB_SEARCH_URL = (
+            form_data.web.YANDEX_WEB_SEARCH_URL
+        )
+        request.app.state.config.YANDEX_WEB_SEARCH_API_KEY = (
+            form_data.web.YANDEX_WEB_SEARCH_API_KEY
+        )
+        request.app.state.config.YANDEX_WEB_SEARCH_CONFIG = (
+            form_data.web.YANDEX_WEB_SEARCH_CONFIG
+        )
 
     return {
         "status": True,
@@ -1295,6 +1329,9 @@ async def update_rag_config(
             "YOUTUBE_LOADER_LANGUAGE": request.app.state.config.YOUTUBE_LOADER_LANGUAGE,
             "YOUTUBE_LOADER_PROXY_URL": request.app.state.config.YOUTUBE_LOADER_PROXY_URL,
             "YOUTUBE_LOADER_TRANSLATION": request.app.state.YOUTUBE_LOADER_TRANSLATION,
+            "YANDEX_WEB_SEARCH_URL": request.app.state.config.YANDEX_WEB_SEARCH_URL,
+            "YANDEX_WEB_SEARCH_API_KEY": request.app.state.config.YANDEX_WEB_SEARCH_API_KEY,
+            "YANDEX_WEB_SEARCH_CONFIG": request.app.state.config.YANDEX_WEB_SEARCH_CONFIG,
         },
     }
 
@@ -1554,14 +1591,19 @@ def save_docs_to_vector_db(
             enable_async=request.app.state.config.ENABLE_ASYNC_EMBEDDING,
         )
 
-        # Run async embedding in sync context
-        embeddings = asyncio.run(
+        # Run async embedding in sync context using the main event loop
+        # This allows the main loop to stay responsive to health checks during long operations
+        embedding_timeout = RAG_EMBEDDING_TIMEOUT
+
+        future = asyncio.run_coroutine_threadsafe(
             embedding_function(
                 list(map(lambda x: x.replace("\n", " "), texts)),
                 prefix=RAG_EMBEDDING_CONTENT_PREFIX,
                 user=user,
-            )
+            ),
+            request.app.state.main_loop,
         )
+        embeddings = future.result(timeout=embedding_timeout)
         log.info(f"embeddings generated {len(embeddings)} for {len(texts)} items")
 
         items = [
@@ -1766,13 +1808,12 @@ def process_file(
                 }
             else:
                 try:
-                    # Release the database connection relative to the 'file' object
-                    # to prevent holding the connection during the slow embedding step.
-                    db.expunge(file)
+                    # Commit any pending changes before the slow embedding step.
+                    # Note: file is already a Pydantic model (not ORM), so no expunge needed.
                     db.commit()
 
                     # External embedding API takes time (5-60s+).
-                    # No DB connection is held here.
+                    # Subsequent updates use fresh sessions via get_db().
                     result = save_docs_to_vector_db(
                         request,
                         docs=docs,
@@ -2231,6 +2272,17 @@ def search_web(
             request,
             request.app.state.config.EXTERNAL_WEB_SEARCH_URL,
             request.app.state.config.EXTERNAL_WEB_SEARCH_API_KEY,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            request.app.state.config.WEB_SEARCH_DOMAIN_FILTER_LIST,
+            user=user,
+        )
+    elif engine == "yandex":
+        return search_yandex(
+            request,
+            request.app.state.config.YANDEX_WEB_SEARCH_URL,
+            request.app.state.config.YANDEX_WEB_SEARCH_API_KEY,
+            request.app.state.config.YANDEX_WEB_SEARCH_CONFIG,
             query,
             request.app.state.config.WEB_SEARCH_RESULT_COUNT,
             request.app.state.config.WEB_SEARCH_DOMAIN_FILTER_LIST,
