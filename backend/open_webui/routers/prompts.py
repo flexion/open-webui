@@ -18,7 +18,7 @@ from open_webui.models.prompt_history import (
 )
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.access_control import has_permission
+from open_webui.utils.access_control import has_permission, filter_allowed_access_grants
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.internal.db import get_session
 from sqlalchemy.orm import Session
@@ -100,8 +100,11 @@ async def get_prompt_list(
     if direction:
         filter["direction"] = direction
 
+    # Pre-fetch user group IDs once - used for both filter and write_access check
+    groups = Groups.get_groups_by_member_id(user.id, db=db)
+    user_group_ids = {group.id for group in groups}
+
     if not (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL):
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
         if groups:
             filter["group_ids"] = [group.id for group in groups]
 
@@ -111,6 +114,17 @@ async def get_prompt_list(
         user.id, filter=filter, skip=skip, limit=limit, db=db
     )
 
+    # Batch-fetch writable prompt IDs in a single query instead of N has_access calls
+    prompt_ids = [prompt.id for prompt in result.items]
+    writable_prompt_ids = AccessGrants.get_accessible_resource_ids(
+        user_id=user.id,
+        resource_type="prompt",
+        resource_ids=prompt_ids,
+        permission="write",
+        user_group_ids=user_group_ids,
+        db=db,
+    )
+
     return PromptAccessListResponse(
         items=[
             PromptAccessResponse(
@@ -118,13 +132,7 @@ async def get_prompt_list(
                 write_access=(
                     (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
                     or user.id == prompt.user_id
-                    or AccessGrants.has_access(
-                        user_id=user.id,
-                        resource_type="prompt",
-                        resource_id=prompt.id,
-                        permission="write",
-                        db=db,
-                    )
+                    or prompt.id in writable_prompt_ids
                 ),
             )
             for prompt in result.items
@@ -436,6 +444,7 @@ class PromptAccessGrantsForm(BaseModel):
 
 @router.post("/id/{prompt_id}/access/update", response_model=Optional[PromptModel])
 async def update_prompt_access_by_id(
+    request: Request,
     prompt_id: str,
     form_data: PromptAccessGrantsForm,
     user=Depends(get_verified_user),
@@ -464,9 +473,59 @@ async def update_prompt_access_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
+    form_data.access_grants = filter_allowed_access_grants(
+        request.app.state.config.USER_PERMISSIONS,
+        user.id,
+        user.role,
+        form_data.access_grants,
+        "sharing.public_prompts",
+    )
+
     AccessGrants.set_access_grants("prompt", prompt_id, form_data.access_grants, db=db)
 
     return Prompts.get_prompt_by_id(prompt_id, db=db)
+
+
+############################
+# TogglePromptActiveById
+############################
+
+
+@router.post("/id/{prompt_id}/toggle", response_model=Optional[PromptModel])
+async def toggle_prompt_active(
+    prompt_id: str, user=Depends(get_verified_user), db: Session = Depends(get_session)
+):
+    prompt = Prompts.get_prompt_by_id(prompt_id, db=db)
+
+    if not prompt:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    if (
+        prompt.user_id != user.id
+        and not AccessGrants.has_access(
+            user_id=user.id,
+            resource_type="prompt",
+            resource_id=prompt.id,
+            permission="write",
+            db=db,
+        )
+        and user.role != "admin"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+
+    result = Prompts.toggle_prompt_active(prompt.id, db=db)
+    if result:
+        return result
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=ERROR_MESSAGES.DEFAULT(),
+    )
 
 
 ############################

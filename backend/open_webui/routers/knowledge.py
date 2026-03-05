@@ -29,8 +29,8 @@ from open_webui.storage.provider import Storage
 
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.utils.auth import get_verified_user, get_admin_user
-from open_webui.utils.access_control import has_permission
-from open_webui.models.access_grants import AccessGrants, has_public_read_access_grant
+from open_webui.utils.access_control import has_permission, filter_allowed_access_grants
+from open_webui.models.access_grants import AccessGrants
 
 
 from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
@@ -115,8 +115,10 @@ async def get_knowledge_bases(
     skip = (page - 1) * limit
 
     filter = {}
+    groups = Groups.get_groups_by_member_id(user.id, db=db)
+    user_group_ids = {group.id for group in groups}
+
     if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
         if groups:
             filter["group_ids"] = [group.id for group in groups]
 
@@ -126,6 +128,17 @@ async def get_knowledge_bases(
         user.id, filter=filter, skip=skip, limit=limit, db=db
     )
 
+    # Batch-fetch writable knowledge IDs in a single query instead of N has_access calls
+    knowledge_base_ids = [knowledge_base.id for knowledge_base in result.items]
+    writable_knowledge_base_ids = AccessGrants.get_accessible_resource_ids(
+        user_id=user.id,
+        resource_type="knowledge",
+        resource_ids=knowledge_base_ids,
+        permission="write",
+        user_group_ids=user_group_ids,
+        db=db,
+    )
+
     return KnowledgeAccessListResponse(
         items=[
             KnowledgeAccessResponse(
@@ -133,13 +146,7 @@ async def get_knowledge_bases(
                 write_access=(
                     user.id == knowledge_base.user_id
                     or (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or AccessGrants.has_access(
-                        user_id=user.id,
-                        resource_type="knowledge",
-                        resource_id=knowledge_base.id,
-                        permission="write",
-                        db=db,
-                    )
+                    or knowledge_base.id in writable_knowledge_base_ids
                 ),
             )
             for knowledge_base in result.items
@@ -166,8 +173,10 @@ async def search_knowledge_bases(
     if view_option:
         filter["view_option"] = view_option
 
+    groups = Groups.get_groups_by_member_id(user.id, db=db)
+    user_group_ids = {group.id for group in groups}
+
     if not user.role == "admin" or not BYPASS_ADMIN_ACCESS_CONTROL:
-        groups = Groups.get_groups_by_member_id(user.id, db=db)
         if groups:
             filter["group_ids"] = [group.id for group in groups]
 
@@ -177,6 +186,17 @@ async def search_knowledge_bases(
         user.id, filter=filter, skip=skip, limit=limit, db=db
     )
 
+    # Batch-fetch writable knowledge IDs in a single query instead of N has_access calls
+    knowledge_base_ids = [knowledge_base.id for knowledge_base in result.items]
+    writable_knowledge_base_ids = AccessGrants.get_accessible_resource_ids(
+        user_id=user.id,
+        resource_type="knowledge",
+        resource_ids=knowledge_base_ids,
+        permission="write",
+        user_group_ids=user_group_ids,
+        db=db,
+    )
+
     return KnowledgeAccessListResponse(
         items=[
             KnowledgeAccessResponse(
@@ -184,13 +204,7 @@ async def search_knowledge_bases(
                 write_access=(
                     user.id == knowledge_base.user_id
                     or (user.role == "admin" and BYPASS_ADMIN_ACCESS_CONTROL)
-                    or AccessGrants.has_access(
-                        user_id=user.id,
-                        resource_type="knowledge",
-                        resource_id=knowledge_base.id,
-                        permission="write",
-                        db=db,
-                    )
+                    or knowledge_base.id in writable_knowledge_base_ids
                 ),
             )
             for knowledge_base in result.items
@@ -237,7 +251,7 @@ async def create_new_knowledge(
     user=Depends(get_verified_user),
 ):
     # NOTE: We intentionally do NOT use Depends(get_session) here.
-    # Database operations (has_permission, insert_new_knowledge) manage their own sessions.
+    # Database operations (has_permission, filter_allowed_access_grants, insert_new_knowledge) manage their own sessions.
     # This prevents holding a connection during embed_knowledge_base_metadata()
     # which makes external embedding API calls (1-5+ seconds).
     if user.role != "admin" and not has_permission(
@@ -248,17 +262,13 @@ async def create_new_knowledge(
             detail=ERROR_MESSAGES.UNAUTHORIZED,
         )
 
-    # Check if user can share publicly
-    if (
-        user.role != "admin"
-        and has_public_read_access_grant(form_data.access_grants)
-        and not has_permission(
-            user.id,
-            "sharing.public_knowledge",
-            request.app.state.config.USER_PERMISSIONS,
-        )
-    ):
-        form_data.access_grants = []
+    form_data.access_grants = filter_allowed_access_grants(
+        request.app.state.config.USER_PERMISSIONS,
+        user.id,
+        user.role,
+        form_data.access_grants,
+        "sharing.public_knowledge",
+    )
 
     knowledge = Knowledges.insert_new_knowledge(user.id, form_data)
 
@@ -468,17 +478,13 @@ async def update_knowledge_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    # Check if user can share publicly
-    if (
-        user.role != "admin"
-        and has_public_read_access_grant(form_data.access_grants)
-        and not has_permission(
-            user.id,
-            "sharing.public_knowledge",
-            request.app.state.config.USER_PERMISSIONS,
-        )
-    ):
-        form_data.access_grants = []
+    form_data.access_grants = filter_allowed_access_grants(
+        request.app.state.config.USER_PERMISSIONS,
+        user.id,
+        user.role,
+        form_data.access_grants,
+        "sharing.public_knowledge",
+    )
 
     knowledge = Knowledges.update_knowledge_by_id(id=id, form_data=form_data)
     if knowledge:
@@ -511,6 +517,7 @@ class KnowledgeAccessGrantsForm(BaseModel):
 
 @router.post("/{id}/access/update", response_model=Optional[KnowledgeFilesResponse])
 async def update_knowledge_access_by_id(
+    request: Request,
     id: str,
     form_data: KnowledgeAccessGrantsForm,
     user=Depends(get_verified_user),
@@ -538,6 +545,14 @@ async def update_knowledge_access_by_id(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
+
+    form_data.access_grants = filter_allowed_access_grants(
+        request.app.state.config.USER_PERMISSIONS,
+        user.id,
+        user.role,
+        form_data.access_grants,
+        "sharing.public_knowledge",
+    )
 
     AccessGrants.set_access_grants("knowledge", id, form_data.access_grants, db=db)
 
@@ -730,6 +745,13 @@ def update_file_from_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
+    # Validate the file actually belongs to this knowledge base
+    if not Knowledges.has_file(knowledge_id=id, file_id=form_data.file_id, db=db):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
     # Remove content from the vector database
     VECTOR_DB_CLIENT.delete(
         collection_name=knowledge.id, filter={"file_id": form_data.file_id}
@@ -799,6 +821,13 @@ def remove_file_from_knowledge_by_id(
 
     file = Files.get_file_by_id(form_data.file_id, db=db)
     if not file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    # Validate the file actually belongs to this knowledge base
+    if not Knowledges.has_file(knowledge_id=id, file_id=form_data.file_id, db=db):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.NOT_FOUND,

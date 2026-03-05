@@ -204,7 +204,7 @@ async def get_channels(
                 UserIdNameStatusResponse(
                     **{
                         **user.model_dump(),
-                        "is_active": Users.is_user_active(user.id, db=db),
+                        "is_active": Users.is_active(user),
                     }
                 )
                 for user in Users.get_users_by_user_ids(user_ids, db=db)
@@ -424,7 +424,7 @@ async def get_channel_by_id(
             UserIdNameStatusResponse(
                 **{
                     **user.model_dump(),
-                    "is_active": Users.is_user_active(user.id, db=db),
+                    "is_active": Users.is_active(user),
                 }
             )
             for user in Users.get_users_by_user_ids(user_ids, db=db)
@@ -540,9 +540,7 @@ async def get_channel_members_by_id(
 
         return {
             "users": [
-                UserModelResponse(
-                    **user.model_dump(), is_active=Users.is_user_active(user.id, db=db)
-                )
+                UserModelResponse(**user.model_dump(), is_active=Users.is_active(user))
                 for user in users
             ],
             "total": total,
@@ -575,9 +573,7 @@ async def get_channel_members_by_id(
 
         return {
             "users": [
-                UserModelResponse(
-                    **user.model_dump(), is_active=Users.is_user_active(user.id, db=db)
-                )
+                UserModelResponse(**user.model_dump(), is_active=Users.is_active(user))
                 for user in users
             ],
             "total": total,
@@ -1582,7 +1578,9 @@ async def update_message_by_id(
         if (
             user.role != "admin"
             and message.user_id != user.id
-            and not channel_has_access(user.id, channel, permission="read", db=db)
+            and not channel_has_access(
+                user.id, channel, permission="write", strict=False, db=db
+            )
         ):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT()

@@ -204,6 +204,43 @@ def has_public_read_access_grant(access_grants: Optional[list]) -> bool:
     return False
 
 
+def has_user_access_grant(access_grants: Optional[list]) -> bool:
+    """
+    Returns True when a direct grant list includes any non-wildcard user grant.
+    """
+    for grant in normalize_access_grants(access_grants):
+        if grant["principal_type"] == "user" and grant["principal_id"] != "*":
+            return True
+    return False
+
+
+def strip_user_access_grants(access_grants: Optional[list]) -> list:
+    """
+    Remove all non-wildcard user grants from the list.
+    Keeps group grants and the public wildcard (user:*) intact.
+    """
+    if not access_grants:
+        return []
+    return [
+        grant
+        for grant in access_grants
+        if not (
+            (
+                grant.get("principal_type")
+                if isinstance(grant, dict)
+                else getattr(grant, "principal_type", None)
+            )
+            == "user"
+            and (
+                grant.get("principal_id")
+                if isinstance(grant, dict)
+                else getattr(grant, "principal_id", None)
+            )
+            != "*"
+        )
+    ]
+
+
 def grants_to_access_control(grants: list) -> Optional[dict]:
     """
     Convert a list of grant objects (AccessGrantModel or AccessGrantResponse)
@@ -402,7 +439,7 @@ class AccessGrantsTable:
             results = []
             for grant_dict in normalized_grants:
                 grant = AccessGrant(
-                    id=grant_dict["id"],
+                    id=str(uuid.uuid4()),
                     resource_type=resource_type,
                     resource_id=resource_id,
                     principal_type=grant_dict["principal_type"],
@@ -455,6 +492,31 @@ class AccessGrantsTable:
                 .all()
             )
             return [AccessGrantModel.model_validate(g) for g in grants]
+
+    def get_grants_by_resources(
+        self,
+        resource_type: str,
+        resource_ids: list[str],
+        db: Optional[Session] = None,
+    ) -> dict[str, list[AccessGrantModel]]:
+        """Batch-fetch grants for multiple resources. Returns {resource_id: [grants]}."""
+        if not resource_ids:
+            return {}
+        with get_db_context(db) as db:
+            grants = (
+                db.query(AccessGrant)
+                .filter(
+                    AccessGrant.resource_type == resource_type,
+                    AccessGrant.resource_id.in_(resource_ids),
+                )
+                .all()
+            )
+            result: dict[str, list[AccessGrantModel]] = {
+                rid: [] for rid in resource_ids
+            }
+            for g in grants:
+                result[g.resource_id].append(AccessGrantModel.model_validate(g))
+            return result
 
     def has_access(
         self,
@@ -514,6 +576,62 @@ class AccessGrantsTable:
                 .first()
             )
             return exists is not None
+
+    def get_accessible_resource_ids(
+        self,
+        user_id: str,
+        resource_type: str,
+        resource_ids: list[str],
+        permission: str = "read",
+        user_group_ids: Optional[set[str]] = None,
+        db: Optional[Session] = None,
+    ) -> set[str]:
+        """
+        Batch check: return the subset of resource_ids that the user can access.
+
+        This replaces calling has_access() in a loop (N+1) with a single query.
+        """
+        if not resource_ids:
+            return set()
+
+        with get_db_context(db) as db:
+            conditions = [
+                and_(
+                    AccessGrant.principal_type == "user",
+                    AccessGrant.principal_id == "*",
+                ),
+                and_(
+                    AccessGrant.principal_type == "user",
+                    AccessGrant.principal_id == user_id,
+                ),
+            ]
+
+            if user_group_ids is None:
+                from open_webui.models.groups import Groups
+
+                user_groups = Groups.get_groups_by_member_id(user_id, db=db)
+                user_group_ids = {group.id for group in user_groups}
+
+            if user_group_ids:
+                conditions.append(
+                    and_(
+                        AccessGrant.principal_type == "group",
+                        AccessGrant.principal_id.in_(user_group_ids),
+                    )
+                )
+
+            rows = (
+                db.query(AccessGrant.resource_id)
+                .filter(
+                    AccessGrant.resource_type == resource_type,
+                    AccessGrant.resource_id.in_(resource_ids),
+                    AccessGrant.permission == permission,
+                    or_(*conditions),
+                )
+                .distinct()
+                .all()
+            )
+            return {row[0] for row in rows}
 
     def get_users_with_access(
         self,

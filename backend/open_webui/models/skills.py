@@ -3,13 +3,13 @@ import time
 from typing import Optional
 
 from sqlalchemy.orm import Session
-from open_webui.internal.db import Base, JSONField, get_db, get_db_context
+from open_webui.internal.db import Base, get_db, get_db_context
 from open_webui.models.users import Users, UserResponse
 from open_webui.models.groups import Groups
 from open_webui.models.access_grants import AccessGrantModel, AccessGrants
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import BigInteger, Boolean, Column, String, Text, or_
+from sqlalchemy import JSON, BigInteger, Boolean, Column, String, Text, or_
 
 log = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class Skill(Base):
     name = Column(Text, unique=True)
     description = Column(Text, nullable=True)
     content = Column(Text)
-    meta = Column(JSONField)
+    meta = Column(JSON)
     is_active = Column(Boolean, default=True)
 
     updated_at = Column(BigInteger)
@@ -110,11 +110,20 @@ class SkillsTable:
     ) -> list[AccessGrantModel]:
         return AccessGrants.get_grants_by_resource("skill", skill_id, db=db)
 
-    def _to_skill_model(self, skill: Skill, db: Optional[Session] = None) -> SkillModel:
+    def _to_skill_model(
+        self,
+        skill: Skill,
+        access_grants: Optional[list[AccessGrantModel]] = None,
+        db: Optional[Session] = None,
+    ) -> SkillModel:
         skill_data = SkillModel.model_validate(skill).model_dump(
             exclude={"access_grants"}
         )
-        skill_data["access_grants"] = self._get_access_grants(skill_data["id"], db=db)
+        skill_data["access_grants"] = (
+            access_grants
+            if access_grants is not None
+            else self._get_access_grants(skill_data["id"], db=db)
+        )
         return SkillModel.model_validate(skill_data)
 
     def insert_new_skill(
@@ -172,9 +181,11 @@ class SkillsTable:
             all_skills = db.query(Skill).order_by(Skill.updated_at.desc()).all()
 
             user_ids = list(set(skill.user_id for skill in all_skills))
+            skill_ids = [skill.id for skill in all_skills]
 
             users = Users.get_users_by_user_ids(user_ids, db=db) if user_ids else []
             users_dict = {user.id: user for user in users}
+            grants_map = AccessGrants.get_grants_by_resources("skill", skill_ids, db=db)
 
             skills = []
             for skill in all_skills:
@@ -182,7 +193,11 @@ class SkillsTable:
                 skills.append(
                     SkillUserModel.model_validate(
                         {
-                            **self._to_skill_model(skill, db=db).model_dump(),
+                            **self._to_skill_model(
+                                skill,
+                                access_grants=grants_map.get(skill.id, []),
+                                db=db,
+                            ).model_dump(),
                             "user": user.model_dump() if user else None,
                         }
                     )
@@ -267,11 +282,20 @@ class SkillsTable:
 
                 items = query.all()
 
+                skill_ids = [skill.id for skill, _ in items]
+                grants_map = AccessGrants.get_grants_by_resources(
+                    "skill", skill_ids, db=db
+                )
+
                 skills = []
                 for skill, user in items:
                     skills.append(
                         SkillUserResponse(
-                            **self._to_skill_model(skill, db=db).model_dump(),
+                            **self._to_skill_model(
+                                skill,
+                                access_grants=grants_map.get(skill.id, []),
+                                db=db,
+                            ).model_dump(),
                             user=(
                                 UserResponse(
                                     **UserModel.model_validate(user).model_dump()

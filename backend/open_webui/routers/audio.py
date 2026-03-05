@@ -639,13 +639,14 @@ def transcription_handler(request, file_path, metadata, user=None):
                 if user and ENABLE_FORWARD_USER_INFO_HEADERS:
                     headers = include_user_info_headers(headers, user)
 
-                r = requests.post(
-                    url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
-                    headers=headers,
-                    files={"file": (filename, open(file_path, "rb"))},
-                    data=payload,
-                    timeout=AIOHTTP_CLIENT_TIMEOUT,
-                )
+                with open(file_path, "rb") as audio_file:
+                    r = requests.post(
+                        url=f"{request.app.state.config.STT_OPENAI_API_BASE_URL}/audio/transcriptions",
+                        headers=headers,
+                        files={"file": (filename, audio_file)},
+                        data=payload,
+                        timeout=AIOHTTP_CLIENT_TIMEOUT,
+                    )
 
                 if r.status_code == 200:
                     # Successful transcription
@@ -1193,7 +1194,9 @@ def transcription(
         )
 
     try:
-        ext = file.filename.split(".")[-1]
+        safe_name = os.path.basename(file.filename) if file.filename else ""
+        ext = safe_name.rsplit(".", 1)[-1] if "." in safe_name else ""
+
         id = uuid.uuid4()
 
         filename = f"{id}.{ext}"
@@ -1202,6 +1205,10 @@ def transcription(
         file_dir = f"{CACHE_DIR}/audio/transcriptions"
         os.makedirs(file_dir, exist_ok=True)
         file_path = f"{file_dir}/{filename}"
+
+        # Defense-in-depth: ensure resolved path stays within intended directory
+        if not os.path.realpath(file_path).startswith(os.path.realpath(file_dir)):
+            raise ValueError("Invalid file path detected")
 
         with open(file_path, "wb") as f:
             f.write(contents)
@@ -1224,7 +1231,7 @@ def transcription(
 
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT(e),
+                detail="Transcription failed.",
             )
 
     except Exception as e:
@@ -1232,7 +1239,7 @@ def transcription(
 
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT(e),
+            detail="Transcription failed.",
         )
 
 
