@@ -1042,16 +1042,21 @@ export const generateModelRecommendation = async (
 
 	try {
 		const response = res?.choices[0]?.message?.content ?? '';
-		const sanitizedResponse = response.replace(/['''`]/g, '"');
 
-		const jsonStartIndex = sanitizedResponse.indexOf('{');
-		const jsonEndIndex = sanitizedResponse.lastIndexOf('}');
+		// Strip markdown code fences if present
+		let cleaned = response.replace(/```(?:json)?\s*/gi, '').replace(/```\s*/g, '');
+
+		// Replace smart quotes with standard quotes
+		cleaned = cleaned.replace(/[\u2018\u2019\u201C\u201D]/g, '"');
+
+		const jsonStartIndex = cleaned.indexOf('{');
+		const jsonEndIndex = cleaned.lastIndexOf('}');
 
 		if (jsonStartIndex !== -1 && jsonEndIndex !== -1) {
-			const jsonResponse = sanitizedResponse.substring(jsonStartIndex, jsonEndIndex + 1);
+			const jsonResponse = cleaned.substring(jsonStartIndex, jsonEndIndex + 1);
 			const parsed = JSON.parse(jsonResponse);
 
-			if (parsed && parsed.recommendations && Array.isArray(parsed.recommendations)) {
+			if (parsed?.recommendations && Array.isArray(parsed.recommendations)) {
 				return parsed.recommendations;
 			}
 		}

@@ -765,27 +765,27 @@ async def generate_moa_response(
         )
 
 
-DEFAULT_MODEL_RECOMMENDATION_PROMPT_TEMPLATE = """You are an expert AI model advisor. Your job is to recommend the best AI model for a user's task from their available models.
+DEFAULT_MODEL_RECOMMENDATION_PROMPT_TEMPLATE = """Task: Given a user's description and a list of available models, return JSON recommending 1-3 models.
 
-Task the user wants to accomplish: {{TASK_DESCRIPTION}}
+User wants to: {{TASK_DESCRIPTION}}
 
-Available models (with metadata):
+Available models:
 {{MODELS_LIST}}
 
-ANALYSIS GUIDELINES:
-- Carefully read each model's name, description, base_model_id, capabilities, system_prompt_hint, and type fields to understand what each model can actually do.
-- Models with type "custom_model_or_pipe" are custom integrations (pipes) that may connect to external providers like Google Gemini, Anthropic Claude, etc. Pay close attention to their names and base_model_id to identify the underlying provider/model.
-- Match the task to model strengths: coding tasks to code-specialized models, creative/writing to large general models, image/video/multimodal tasks to models with vision or generation capabilities, etc.
-- Prefer models whose name, description, or capabilities explicitly mention the task type (e.g., a model named "gemini" or with video/image capabilities for video generation tasks).
-- Do NOT just recommend the largest models. Recommend the most RELEVANT models for the specific task.
+Rules:
+1. Models with type "custom_model_or_pipe" are pipes to external providers (e.g. Google Gemini, Anthropic Claude). Check their name and base_model_id to identify the provider.
+2. Match task to model strengths. Coding -> code models. Images -> image generation models. Video -> video models. Writing -> large general models.
+3. Prefer models whose name, description, or capabilities explicitly match the task.
+4. Use EXACT model IDs from the list. Do not invent IDs.
+5. Return 1-3 recommendations, best first.
 
-You MUST respond with ONLY a JSON object in this exact format, no other text:
-{"recommendations": [{"model_id": "exact_model_id_from_list", "reason": "Brief 1-sentence explanation of why this model is best for this specific task"}]}
+Return ONLY this JSON, no markdown, no explanation, no extra text before or after:
+{"recommendations":[{"model_id":"exact_id","reason":"one sentence"}]}
 
-Important:
-- Only recommend models from the available list above using their EXACT id values
-- Recommend 1-3 models, with the best match first
-- Keep reasons concise and specific to the task"""
+Example valid response:
+{"recommendations":[{"model_id":"gpt-4o","reason":"Strong general-purpose model with vision capabilities"}]}
+
+BEGIN JSON RESPONSE:"""
 
 
 @router.post("/model_recommendation/completions")
