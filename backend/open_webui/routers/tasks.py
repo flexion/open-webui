@@ -16,6 +16,7 @@ from open_webui.utils.task import (
     tags_generation_template,
     emoji_generation_template,
     moa_response_generation_template,
+    model_recommendation_template,
 )
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.constants import TASKS
@@ -761,4 +762,94 @@ async def generate_moa_response(
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={"detail": str(e)},
+        )
+
+
+DEFAULT_MODEL_RECOMMENDATION_PROMPT_TEMPLATE = """Task: Given a user's description and a list of available models, return JSON recommending 1-3 models.
+
+User wants to: {{TASK_DESCRIPTION}}
+
+Available models:
+{{MODELS_LIST}}
+
+Rules:
+1. Models with type "custom_model_or_pipe" are pipes to external providers (e.g. Google Gemini, Anthropic Claude). Check their name and base_model_id to identify the provider.
+2. Match task to model strengths. Coding -> code models. Images -> image generation models. Video -> video models. Writing -> large general models.
+3. Prefer models whose name, description, or capabilities explicitly match the task.
+4. Use EXACT model IDs from the list. Do not invent IDs.
+5. Return 1-3 recommendations, best first.
+
+Return ONLY this JSON, no markdown, no explanation, no extra text before or after:
+{"recommendations":[{"model_id":"exact_id","reason":"one sentence"}]}
+
+Example valid response:
+{"recommendations":[{"model_id":"gpt-4o","reason":"Strong general-purpose model with vision capabilities"}]}
+
+BEGIN JSON RESPONSE:"""
+
+
+@router.post("/model_recommendation/completions")
+async def generate_model_recommendation(
+    request: Request, form_data: dict, user=Depends(get_verified_user)
+):
+    models = request.app.state.MODELS
+
+    model_id = form_data["model"]
+    if model_id not in models:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model not found",
+        )
+
+    task_model_id = get_task_model_id(
+        model_id,
+        request.app.state.config.TASK_MODEL,
+        request.app.state.config.TASK_MODEL_EXTERNAL,
+        models,
+    )
+
+    log.debug(
+        f"generating model recommendation using model {task_model_id} for user {user.email}"
+    )
+
+    task_description = form_data.get("task_description", "")
+    available_models = form_data.get("available_models", [])
+
+    models_info_lines = []
+    for m in available_models:
+        parts = [f"ID: {m['id']}"]
+        for key in ["name", "description", "owned_by", "type", "base_model_id", "capabilities", "system_prompt_hint"]:
+            if m.get(key):
+                parts.append(f"{key}: {m[key]}")
+        models_info_lines.append("- " + ", ".join(parts))
+    models_info = "\n".join(models_info_lines)
+
+    template = DEFAULT_MODEL_RECOMMENDATION_PROMPT_TEMPLATE
+    content = model_recommendation_template(
+        template, task_description, models_info, user
+    )
+
+    payload = {
+        "model": task_model_id,
+        "messages": [{"role": "user", "content": content}],
+        "stream": False,
+        "metadata": {
+            **(request.state.metadata if hasattr(request.state, "metadata") else {}),
+            "task": str(TASKS.MODEL_RECOMMENDATION),
+            "task_body": form_data,
+        },
+    }
+
+    try:
+        payload = await process_pipeline_inlet_filter(request, payload, user, models)
+    except Exception as e:
+        raise e
+
+    try:
+        return await generate_chat_completion(request, form_data=payload, user=user)
+    except Exception as e:
+        log.error("Exception occurred", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"detail": "An internal error has occurred."},
         )

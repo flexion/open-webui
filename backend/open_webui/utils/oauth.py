@@ -1789,33 +1789,33 @@ class OAuthManager:
                         log.warning("Username claim is missing, using email as name")
                         name = email
 
-                role = await self.get_user_role(
-                    None, user_data, provider, token.get("access_token")
-                )
-
-                user = Auths.insert_new_auth(
-                    email=email,
-                    password=get_password_hash(
-                        str(uuid.uuid4())
-                    ),  # Random password, not used
-                    name=name,
-                    profile_image_url=picture_url,
-                    role=role,
-                    oauth=oauth_data,
-                    db=db
-                )
-
-                if auth_manager_config.WEBHOOK_URL:
-                    await post_webhook(
-                        WEBUI_NAME,
-                        auth_manager_config.WEBHOOK_URL,
-                        WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-                        {
-                            "action": "signup",
-                            "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
-                            "user": user.model_dump_json(exclude_none=True),
-                        },
+                    role = await self.get_user_role(
+                        None, user_data, provider, token.get("access_token")
                     )
+
+                    user = Auths.insert_new_auth(
+                        email=email,
+                        password=get_password_hash(
+                            str(uuid.uuid4())
+                        ),  # Random password, not used
+                        name=name,
+                        profile_image_url=picture_url,
+                        role=role,
+                        oauth=oauth_data,
+                        db=db
+                    )
+
+                    if auth_manager_config.WEBHOOK_URL:
+                        await post_webhook(
+                            WEBUI_NAME,
+                            auth_manager_config.WEBHOOK_URL,
+                            WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                            {
+                                "action": "signup",
+                                "message": WEBHOOK_MESSAGES.USER_SIGNUP(user.name),
+                                "user": user.model_dump_json(exclude_none=True),
+                            },
+                        )
 
                     apply_default_group_assignment(
                         request.app.state.config.DEFAULT_GROUP_ID, user.id, db=db

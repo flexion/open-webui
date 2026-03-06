@@ -346,6 +346,15 @@ def moa_response_generation_template(
     return template
 
 
+def model_recommendation_template(
+    template: str, task_description: str, models_info: str, user: Optional[Any] = None
+) -> str:
+    template = template.replace("{{TASK_DESCRIPTION}}", task_description)
+    template = template.replace("{{MODELS_LIST}}", models_info)
+    template = prompt_template(template, user)
+    return template
+
+
 def tools_function_calling_generation_template(template: str, tools_specs: str) -> str:
     template = template.replace("{{TOOLS}}", tools_specs)
     return template
