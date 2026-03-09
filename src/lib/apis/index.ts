@@ -1003,6 +1003,71 @@ export const generateAutoCompletion = async (
 	}
 };
 
+export const generateModelRecommendation = async (
+	token: string = '',
+	model: string,
+	taskDescription: string,
+	availableModels: Record<string, string>[]
+): Promise<{ model_id: string; reason: string }[]> => {
+	let error = null;
+
+	const res = await fetch(`${WEBUI_BASE_URL}/api/v1/tasks/model_recommendation/completions`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			Authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({
+			model: model,
+			task_description: taskDescription,
+			available_models: availableModels
+		})
+	})
+		.then(async (res) => {
+			if (!res.ok) throw await res.json();
+			return res.json();
+		})
+		.catch((err) => {
+			console.error(err);
+			if ('detail' in err) {
+				error = err.detail;
+			}
+			return null;
+		});
+
+	if (error) {
+		throw error;
+	}
+
+	try {
+		const response = res?.choices[0]?.message?.content ?? '';
+
+		// Strip markdown code fences if present
+		let cleaned = response.replace(/```(?:json)?\s*/gi, '').replace(/```\s*/g, '');
+
+		// Replace smart quotes with standard quotes
+		cleaned = cleaned.replace(/[\u2018\u2019\u201C\u201D]/g, '"');
+
+		const jsonStartIndex = cleaned.indexOf('{');
+		const jsonEndIndex = cleaned.lastIndexOf('}');
+
+		if (jsonStartIndex !== -1 && jsonEndIndex !== -1) {
+			const jsonResponse = cleaned.substring(jsonStartIndex, jsonEndIndex + 1);
+			const parsed = JSON.parse(jsonResponse);
+
+			if (parsed?.recommendations && Array.isArray(parsed.recommendations)) {
+				return parsed.recommendations;
+			}
+		}
+
+		return [];
+	} catch (e) {
+		console.error('Failed to parse model recommendation response: ', e);
+		return [];
+	}
+};
+
 export const generateMoACompletion = async (
 	token: string = '',
 	model: string,
