@@ -772,7 +772,7 @@ async def generate_model_recommendation(
     models_info = "\n".join(models_info_lines)
 
     template = DEFAULT_MODEL_RECOMMENDATION_PROMPT_TEMPLATE
-    content = model_recommendation_template(
+    content = await model_recommendation_template(
         template, task_description, models_info, user
     )
 
