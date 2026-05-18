@@ -12,12 +12,173 @@ FlexChat is Flexion's customized deployment of [Open WebUI](https://github.com/o
 
 ### Keeping Up with Upstream
 
-To incorporate upstream Open WebUI updates into our `flex` branch:
+FlexChat tracks upstream [open-webui/open-webui](https://github.com/open-webui/open-webui). The `flex` branch is rebased onto upstream releases to incorporate new features and fixes while preserving Flexion customizations.
+
+#### One-Time Setup
 
 ```bash
-# Add upstream remote (one-time setup)
+# Add upstream remote (if not already configured)
 git remote add upstream https://github.com/open-webui/open-webui.git
+
+# Verify remotes
+git remote -v
+# origin    git@github.com:flexion/open-webui (fetch)
+# upstream  https://github.com/open-webui/open-webui.git (fetch)
 ```
+
+---
+
+#### Option A — Automated Sync (Recommended)
+
+Use the **Upstream Sync** GitHub Actions workflow for future syncs. It handles drift detection, rebase, AI-assisted conflict resolution via Amazon Bedrock, and opens a draft PR for your review.
+
+**Prerequisites — configure these secrets once in repo Settings → Secrets and variables → Actions:**
+
+| Secret | Description |
+|--------|-------------|
+| `SYNC_PAT` | GitHub Personal Access Token with `repo` + `workflow` scopes. Required because `GITHUB_TOKEN` cannot push branches that contain `.github/workflows/` files. |
+| `AWS_BEDROCK_ROLE_ARN` | IAM role ARN with `bedrock:InvokeModel` permission on `anthropic.claude-3-5-sonnet-20241022-v2:0`. Trust policy must allow `token.actions.githubusercontent.com` for `repo:flexion/open-webui:ref:refs/heads/*`. |
+| `AWS_REGION` | AWS region where Bedrock is available (e.g., `us-east-1`). |
+
+**Triggering the workflow:**
+
+1. Go to **Actions → Upstream Sync → Run workflow**
+2. Set `dry_run: false` (default is `true` — safe to run first to check drift)
+3. Leave `target_ref` as default (`refs/heads/main`) to sync to upstream's latest release
+4. Click **Run workflow**
+
+**What the workflow does:**
+1. Detects how many commits `flex` is behind upstream
+2. Creates a throwaway branch `upstream-sync/YYYYMMDD-HHMMSS` from `flex`
+3. Rebases onto upstream, resolving conflicts automatically:
+   - Binary files (`*.png`, `*.ico`, `*.wasm`) → keeps Flexion's version (`--ours`)
+   - Lock files (`package-lock.json`, `uv.lock`) → takes upstream's version (`--theirs`)
+   - Flexion-unique files (`functions/`, `static/static/providers/`, `README_FLEXION.md`) → keeps Flexion's version
+   - Shared source files → Amazon Bedrock Claude resolves (capped at 10 files; beyond that, raw markers left for manual review)
+4. Pushes the throwaway branch and opens a **draft PR** targeting `flex`
+5. The draft PR includes a conflict resolution log and HITL review checklist
+
+**After the workflow opens a draft PR:**
+1. Review the conflict resolution log in the PR description
+2. Verify Flexion features still work (see checklist in PR body)
+3. Approve and merge the draft PR
+4. Then fast-forward `flex` locally:
+   ```bash
+   git checkout flex
+   git pull origin flex
+   ```
+
+---
+
+#### Option B — Manual Rebase Runbook
+
+Use this when you need direct control, or when the automated workflow encounters issues.
+
+**Step 1 — Safety prep**
+
+```bash
+# Fetch latest from both remotes
+git fetch upstream
+git fetch origin
+
+# Create a backup tag (recovery point)
+git tag flex-backup-pre-rebase-$(date +%Y%m%d) flex
+git push origin flex-backup-pre-rebase-$(date +%Y%m%d)
+
+# Create a throwaway working branch (never rebase flex directly)
+git checkout -b flex-rebase-onto-vX.Y.Z flex
+```
+
+**Step 2 — Rebase**
+
+```bash
+git rebase upstream/main
+```
+
+**Step 3 — Resolve conflicts** (if any)
+
+Use this priority order for each conflicted file:
+
+| File Type | Command | Rationale |
+|-----------|---------|-----------|
+| Binary (`*.png`, `*.ico`, `*.wasm`) | `git checkout --ours <file> && git add <file>` | Not text-mergeable; Flexion icons are custom |
+| Lock files (`package-lock.json`, `uv.lock`) | `git checkout --theirs <file> && git add <file>` | Regenerated deterministically; take upstream's |
+| Flexion-unique (`functions/`, `static/static/providers/`, `README_FLEXION.md`) | `git checkout --ours <file> && git add <file>` | Entirely Flexion additions; upstream never touches these |
+| Shared source files (`oauth.py`, `models.py`, etc.) | Manual merge | Preserve Flexion intent, incorporate upstream structure |
+
+After resolving each file: `git add <file>` then `git rebase --continue`
+
+If a commit becomes empty after resolution: `git rebase --skip`
+
+If the rebase becomes unresolvable: `git rebase --abort` (your throwaway branch returns to its pre-rebase state)
+
+**Step 4 — Verify**
+
+```bash
+# Confirm upstream/main is an ancestor of the rebased branch
+git merge-base --is-ancestor upstream/main flex-rebase-onto-vX.Y.Z && echo "PASS"
+
+# Confirm Flexion commits are on top (should be 3)
+git log --oneline flex-rebase-onto-vX.Y.Z ^upstream/main
+
+# Confirm no merge commits (clean linear history)
+git log --merges flex-rebase-onto-vX.Y.Z ^upstream/main | wc -l  # must be 0
+```
+
+**Step 5 — Push and open draft PR**
+
+```bash
+git push --force-with-lease origin flex-rebase-onto-vX.Y.Z
+
+gh pr create \
+  --draft \
+  --base flex \
+  --head flex-rebase-onto-vX.Y.Z \
+  --title "feat: rebase Flexion customizations onto vX.Y.Z" \
+  --body "Upstream sync: vPREV → vX.Y.Z. See conflict log for details."
+```
+
+**Step 6 — After human review and approval**
+
+```bash
+# Fast-forward flex to the rebased branch
+git checkout flex
+git merge --ff-only flex-rebase-onto-vX.Y.Z
+git push --force-with-lease origin flex
+
+# Update origin/main to mirror upstream/main
+git checkout main
+git merge --ff-only upstream/main
+git push origin main
+
+# Clean up throwaway branch
+git branch -d flex-rebase-onto-vX.Y.Z
+git push origin --delete flex-rebase-onto-vX.Y.Z
+```
+
+Commit message pattern: `feat: rebase Flexion customizations onto vX.Y.Z`
+
+---
+
+#### Flexion Customization Inventory
+
+These files contain Flexion-specific changes that must survive every upstream sync:
+
+| File | Purpose | Conflict Risk |
+|------|---------|---------------|
+| `backend/open_webui/utils/oauth.py` | Google Groups OAuth implementation | High — upstream actively develops auth |
+| `backend/open_webui/routers/models.py` | Custom model routing | Medium |
+| `backend/open_webui/constants.py` | `TASKS.MODEL_RECOMMENDATION` enum value | Low — append-only |
+| `backend/open_webui/routers/tasks.py` | `POST /model_recommendation/completions` endpoint | Medium — task routing may change |
+| `backend/open_webui/utils/task.py` | `model_recommendation_template()` utility | Low — append-only |
+| `src/lib/components/chat/Navbar.svelte` | Flexion navbar changes | Medium |
+| `src/lib/components/chat/Placeholder.svelte` | Flexion UI tweak | Low |
+| `src/lib/apis/index.ts` | Flexion API additions | Medium |
+| `src/lib/components/chat/ModelHelperModal.svelte` | Model selector UI (Flexion-unique) | None — Flexion-only file |
+| `functions/` (5 files) | Custom Flexion functions | None — Flexion-only directory |
+| `static/static/providers/` (17 files) | Provider icons + metadata | None — Flexion-only directory |
+| `README_FLEXION.md` | This file | None — Flexion-only file |
+| `docs/oauth-google-groups.md` | OAuth documentation | None — Flexion-only file |
 
 ## Local Development Setup
 
