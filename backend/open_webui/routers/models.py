@@ -32,7 +32,7 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 
 
 from open_webui.utils.auth import get_admin_user, get_verified_user
