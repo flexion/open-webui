@@ -266,7 +266,7 @@
 			messageInput?.setText(data, async () => {
 				if (!($settings?.insertSuggestionPrompt ?? false)) {
 					await tick();
-					submitHandler(prompt);
+					submitHandler(data);
 				}
 			});
 		}
@@ -1967,7 +1967,7 @@
 			toast.warning($i18n.t('Please connect all required integrations before sending a message'));
 			return;
 		}
-		if (userPrompt === '' && files.length === 0) {
+		if (!userPrompt.trim() && files.length === 0) {
 			toast.error($i18n.t('Please enter a prompt'));
 			return;
 		}
