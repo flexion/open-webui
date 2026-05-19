@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flex with full history and tags
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           ref: flex
           fetch-depth: 0
