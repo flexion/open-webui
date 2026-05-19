@@ -114,7 +114,7 @@
 
 ### Incident 5: `ACCESS_PROHIBITED` for non-admin users
 - **Cause**: v0.9.5 strictly enforces `OAUTH_ALLOWED_ROLES` — users not in a matching group are denied. `OAUTH_ALLOWED_ROLES` was never set in any historical task definition (v0.8.10 silently fell through). `all-employees@flexion.us` does not exist as a Google group.
-- **Resolution**: Set `ENABLE_OAUTH_ROLE_MANAGEMENT=false` — rely on `OAUTH_ALLOWED_DOMAINS` for access control
+- **Resolution**: Created `flexion-delivery-access@flexion.us` Google group; set `OAUTH_ALLOWED_ROLES=flexion-delivery-access@flexion.us`. Add all intended FlexChat users to this group in Google Admin.
 - **PR**: flexion/flexion-open-webui-infra#458
 
 ### Incident 6: lgarceau@flexion.us lost chat history (duplicate user accounts)
