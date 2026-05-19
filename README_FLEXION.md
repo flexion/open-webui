@@ -30,7 +30,7 @@ git remote -v
 
 #### Option A — Automated Sync (Recommended)
 
-Use the **Upstream Sync** GitHub Actions workflow for future syncs. It detects drift, rebases onto upstream applying deterministic conflict rules, and opens a PR for your review. Shared-source conflicts that need human judgment are committed with conflict markers intact, so you resolve them in the PR rather than in the workflow.
+The **Upstream Sync** GitHub Actions workflow runs **on a daily schedule** (09:00 UTC). Each day it checks upstream for a new `v*.*.*` release tag, and if there is one newer than the tag `flex` is currently based on, it rebases onto that tag and opens a PR. On days with no new release, it exits cleanly without making changes.
 
 **Prerequisites — configure this secret once in repo Settings → Secrets and variables → Actions:**
 
@@ -38,34 +38,40 @@ Use the **Upstream Sync** GitHub Actions workflow for future syncs. It detects d
 |--------|-------------|
 | `SYNC_PAT` | GitHub fine-grained PAT with `Contents: write`, `Pull requests: write`, and `Workflows: write` on this repo. Required because `GITHUB_TOKEN` cannot push branches that contain `.github/workflows/` files. Must be SSO-authorized for the `flexion` org. |
 
-**Triggering the workflow:**
+**Manual runs (optional):**
 
-1. Go to **Actions → Upstream Sync → Run workflow**
-2. Run with `dry_run: true` first (default) — reports drift count and exits without changing anything
-3. Once you're ready to sync, run again with `dry_run: false`
-4. Leave `target_ref` as default (`refs/heads/main`) to sync to upstream's latest
+You can also trigger the workflow manually from **Actions → Upstream Sync → Run workflow**:
+
+- Leave `target_tag` blank to auto-detect the latest upstream `v*.*.*` tag (same logic as the schedule)
+- Set `target_tag` to a specific tag (e.g. `v0.9.6`) to sync to that exact release
+- Set `force: true` to open a sync PR even if `flex` is already on the target tag
 
 **What the workflow does:**
-1. Detects how many commits `flex` is behind upstream
-2. Creates a throwaway branch `upstream-sync/YYYYMMDD-HHMMSS` from `flex`
-3. Rebases onto upstream, applying these rules per conflicted file:
+1. Fetches all upstream tags
+2. Picks the target: the explicit `target_tag` input, or the latest `v*.*.*` tag from upstream
+3. Determines flex's current base via `git describe --tags --abbrev=0 flex`
+4. Exits cleanly if flex is already on the target (and `force` is not set)
+5. Refuses to sync backward (target older than current base) unless `force: true`
+6. Creates a throwaway branch `upstream-sync/<target>-YYYYMMDD-HHMMSS` from `flex`
+7. Rebases onto the target tag, applying these rules per conflicted file:
    - Binary files (`*.png`, `*.ico`, `*.wasm`) → keeps Flexion's version (`--ours`)
    - Lock files (`package-lock.json`, `uv.lock`) → takes upstream's version (`--theirs`); regenerate locally if needed
    - Flexion-unique files (`functions/`, `static/static/providers/`, `README_FLEXION.md`) → keeps Flexion's version (`--ours`)
    - Shared source files → conflict markers are committed as-is; the human resolves them in the PR
-4. Pushes the throwaway branch and opens a PR targeting `flex` (draft if any manual review is required, ready-for-review if the rebase was clean)
-5. The PR body includes a conflict resolution log and (when applicable) a HITL review checklist with the list of files containing markers
+8. Pushes the throwaway branch and opens a PR targeting `flex` — draft if any manual review is required, ready-for-review if the rebase was clean
+9. The PR body includes a conflict resolution log and (when applicable) a HITL review checklist with the list of files needing manual resolution
 
 **After the workflow opens a PR:**
 1. Review the conflict resolution log in the PR description
 2. If files need manual resolution: check out the branch, fix the markers, push, then mark the PR ready for review
 3. Verify Flexion features still work (see checklist in PR body)
 4. Approve and merge the PR
-5. Then fast-forward `flex` locally:
+5. Fast-forward `flex` locally:
    ```bash
    git checkout flex
    git pull origin flex
    ```
+6. Publish the new release tag to ECR by running the **Publish flex image to ECR** workflow with `version=<target_tag> environment=dev` (and `environment=prod` once dev is verified)
 
 ---
 
