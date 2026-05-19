@@ -30,39 +30,38 @@ git remote -v
 
 #### Option A — Automated Sync (Recommended)
 
-Use the **Upstream Sync** GitHub Actions workflow for future syncs. It handles drift detection, rebase, AI-assisted conflict resolution via Amazon Bedrock, and opens a draft PR for your review.
+Use the **Upstream Sync** GitHub Actions workflow for future syncs. It detects drift, rebases onto upstream applying deterministic conflict rules, and opens a PR for your review. Shared-source conflicts that need human judgment are committed with conflict markers intact, so you resolve them in the PR rather than in the workflow.
 
-**Prerequisites — configure these secrets once in repo Settings → Secrets and variables → Actions:**
+**Prerequisites — configure this secret once in repo Settings → Secrets and variables → Actions:**
 
 | Secret | Description |
 |--------|-------------|
-| `SYNC_PAT` | GitHub Personal Access Token with `repo` + `workflow` scopes. Required because `GITHUB_TOKEN` cannot push branches that contain `.github/workflows/` files. |
-| `AWS_BEDROCK_ROLE_ARN` | IAM role ARN with `bedrock:InvokeModel` permission on `anthropic.claude-3-5-sonnet-20241022-v2:0`. Trust policy must allow `token.actions.githubusercontent.com` for `repo:flexion/open-webui:ref:refs/heads/*`. |
-| `AWS_REGION` | AWS region where Bedrock is available (e.g., `us-east-1`). |
+| `SYNC_PAT` | GitHub fine-grained PAT with `Contents: write`, `Pull requests: write`, and `Workflows: write` on this repo. Required because `GITHUB_TOKEN` cannot push branches that contain `.github/workflows/` files. Must be SSO-authorized for the `flexion` org. |
 
 **Triggering the workflow:**
 
 1. Go to **Actions → Upstream Sync → Run workflow**
-2. Set `dry_run: false` (default is `true` — safe to run first to check drift)
-3. Leave `target_ref` as default (`refs/heads/main`) to sync to upstream's latest release
-4. Click **Run workflow**
+2. Run with `dry_run: true` first (default) — reports drift count and exits without changing anything
+3. Once you're ready to sync, run again with `dry_run: false`
+4. Leave `target_ref` as default (`refs/heads/main`) to sync to upstream's latest
 
 **What the workflow does:**
 1. Detects how many commits `flex` is behind upstream
 2. Creates a throwaway branch `upstream-sync/YYYYMMDD-HHMMSS` from `flex`
-3. Rebases onto upstream, resolving conflicts automatically:
+3. Rebases onto upstream, applying these rules per conflicted file:
    - Binary files (`*.png`, `*.ico`, `*.wasm`) → keeps Flexion's version (`--ours`)
-   - Lock files (`package-lock.json`, `uv.lock`) → takes upstream's version (`--theirs`)
-   - Flexion-unique files (`functions/`, `static/static/providers/`, `README_FLEXION.md`) → keeps Flexion's version
-   - Shared source files → Amazon Bedrock Claude resolves (capped at 10 files; beyond that, raw markers left for manual review)
-4. Pushes the throwaway branch and opens a **draft PR** targeting `flex`
-5. The draft PR includes a conflict resolution log and HITL review checklist
+   - Lock files (`package-lock.json`, `uv.lock`) → takes upstream's version (`--theirs`); regenerate locally if needed
+   - Flexion-unique files (`functions/`, `static/static/providers/`, `README_FLEXION.md`) → keeps Flexion's version (`--ours`)
+   - Shared source files → conflict markers are committed as-is; the human resolves them in the PR
+4. Pushes the throwaway branch and opens a PR targeting `flex` (draft if any manual review is required, ready-for-review if the rebase was clean)
+5. The PR body includes a conflict resolution log and (when applicable) a HITL review checklist with the list of files containing markers
 
-**After the workflow opens a draft PR:**
+**After the workflow opens a PR:**
 1. Review the conflict resolution log in the PR description
-2. Verify Flexion features still work (see checklist in PR body)
-3. Approve and merge the draft PR
-4. Then fast-forward `flex` locally:
+2. If files need manual resolution: check out the branch, fix the markers, push, then mark the PR ready for review
+3. Verify Flexion features still work (see checklist in PR body)
+4. Approve and merge the PR
+5. Then fast-forward `flex` locally:
    ```bash
    git checkout flex
    git pull origin flex

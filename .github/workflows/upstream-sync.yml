@@ -1,0 +1,208 @@
+name: Upstream Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Detect drift only, do not rebase or open a PR'
+        type: boolean
+        default: true
+      target_ref:
+        description: 'Upstream ref to sync to (default: upstream/main)'
+        type: string
+        default: refs/heads/main
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout flex with full history
+        uses: actions/checkout@v5
+        with:
+          ref: flex
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name 'flex-upstream-sync-bot'
+          git config user.email 'flex-upstream-sync-bot@users.noreply.github.com'
+          git remote add upstream https://github.com/open-webui/open-webui.git
+          git fetch upstream --tags --prune
+
+      - name: Detect drift
+        id: drift
+        run: |
+          BEHIND=$(git rev-list --count flex..upstream/main)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Drift::flex is $BEHIND commits behind upstream/main"
+
+      - name: Exit early if no drift
+        if: steps.drift.outputs.behind == '0'
+        run: |
+          echo "::notice::flex is already up to date with upstream. Nothing to do."
+          exit 0
+
+      - name: Exit early if dry run
+        if: inputs.dry_run == true && steps.drift.outputs.behind != '0'
+        run: |
+          echo "::notice::Dry run — skipping rebase and PR creation. flex is ${{ steps.drift.outputs.behind }} commits behind."
+          exit 0
+
+      - name: Create throwaway branch
+        if: inputs.dry_run == false && steps.drift.outputs.behind != '0'
+        id: branch
+        run: |
+          BRANCH="upstream-sync/$(date -u +%Y%m%d-%H%M%S)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH"
+
+      - name: Rebase with deterministic conflict rules
+        if: inputs.dry_run == false && steps.drift.outputs.behind != '0'
+        id: rebase
+        env:
+          TARGET_REF: ${{ inputs.target_ref }}
+        run: |
+          set +e
+
+          # Initialize the resolution log (markdown table consumed by the PR body)
+          {
+            echo "# Upstream sync conflict resolution log"
+            echo ""
+            echo "Rebasing \`flex\` onto upstream \`${TARGET_REF}\`."
+            echo ""
+            echo "| File | Rule applied | Outcome |"
+            echo "|------|--------------|---------|"
+          } > conflict-resolution-log.md
+
+          : > manual-review.txt
+
+          # Map upstream's target_ref to a local ref we can rebase onto.
+          # Common input: "refs/heads/main" → "upstream/main"
+          REBASE_ONTO="${TARGET_REF#refs/heads/}"
+          REBASE_ONTO="upstream/${REBASE_ONTO}"
+
+          git rebase "${REBASE_ONTO}"
+          while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+
+            if [ -z "$CONFLICTS" ]; then
+              # Rebase paused but no unmerged paths — likely an empty/applied commit
+              git rebase --continue 2>/dev/null || git rebase --skip
+              continue
+            fi
+
+            for f in $CONFLICTS; do
+              case "$f" in
+                *.png|*.ico|*.wasm)
+                  git checkout --ours -- "$f"
+                  git add "$f"
+                  echo "| \`$f\` | binary → ours | resolved |" >> conflict-resolution-log.md
+                  ;;
+                package-lock.json|*/package-lock.json|uv.lock|*/uv.lock)
+                  git checkout --theirs -- "$f"
+                  git add "$f"
+                  echo "| \`$f\` | lockfile → theirs | resolved |" >> conflict-resolution-log.md
+                  ;;
+                functions/*|static/static/providers/*|README_FLEXION.md)
+                  git checkout --ours -- "$f"
+                  git add "$f"
+                  echo "| \`$f\` | flexion-unique → ours | resolved |" >> conflict-resolution-log.md
+                  ;;
+                *)
+                  # Shared source — leave conflict markers in the file content,
+                  # but `git add` so the rebase can continue. The committed file
+                  # will contain <<<<<<< markers for the human to resolve in the PR.
+                  git add "$f"
+                  echo "| \`$f\` | shared source — markers preserved | **manual review required** |" >> conflict-resolution-log.md
+                  echo "$f" >> manual-review.txt
+                  ;;
+              esac
+            done
+
+            git rebase --continue 2>/dev/null
+            REBASE_STATUS=$?
+            if [ $REBASE_STATUS -ne 0 ] && [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ]; then
+              # rebase --continue exited non-zero AND rebase dirs gone → rebase aborted itself
+              echo "::error::Rebase aborted unexpectedly after attempting to continue."
+              exit 1
+            fi
+          done
+          set -e
+
+          # Deduplicate the manual-review list
+          if [ -s manual-review.txt ]; then
+            sort -u manual-review.txt -o manual-review.txt
+            MANUAL_COUNT=$(wc -l < manual-review.txt | tr -d ' ')
+            echo "manual_count=${MANUAL_COUNT}" >> "$GITHUB_OUTPUT"
+          else
+            echo "manual_count=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push throwaway branch and open draft PR
+        if: inputs.dry_run == false && steps.drift.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          MANUAL_COUNT: ${{ steps.rebase.outputs.manual_count }}
+          TARGET_REF: ${{ inputs.target_ref }}
+          BEHIND: ${{ steps.drift.outputs.behind }}
+        run: |
+          git push -u origin "$BRANCH"
+
+          BODY_FILE=$(mktemp)
+          cat conflict-resolution-log.md > "$BODY_FILE"
+
+          {
+            echo ""
+            echo "## Drift"
+            echo ""
+            echo "\`flex\` was ${BEHIND} commits behind upstream at the time of this sync."
+            echo ""
+          } >> "$BODY_FILE"
+
+          if [ "${MANUAL_COUNT:-0}" -gt 0 ]; then
+            {
+              echo "## HITL review checklist"
+              echo ""
+              echo "${MANUAL_COUNT} file(s) require manual resolution. The conflict markers"
+              echo "(\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`) are still in the committed content."
+              echo ""
+              echo "- [ ] Open each marked file and resolve the conflict"
+              echo "- [ ] Run \`npm run build\` locally"
+              echo "- [ ] Run \`docker build .\` locally"
+              echo "- [ ] Verify Flexion branding, OAuth flow, and BAG integration still work"
+              echo "- [ ] Convert this PR from draft to ready for review"
+              echo ""
+              echo "<details><summary>Files needing manual review</summary>"
+              echo ""
+              echo '```'
+              cat manual-review.txt
+              echo '```'
+              echo ""
+              echo "</details>"
+            } >> "$BODY_FILE"
+            DRAFT_FLAG="--draft"
+          else
+            {
+              echo "## Clean rebase"
+              echo ""
+              echo "All conflicts were resolved by deterministic rules. No manual review needed."
+              echo "Still recommend a local smoke test before merging:"
+              echo ""
+              echo "- [ ] \`npm run build\`"
+              echo "- [ ] \`docker build .\`"
+              echo "- [ ] Verify Flexion features still work"
+            } >> "$BODY_FILE"
+            DRAFT_FLAG=""
+          fi
+
+          gh pr create $DRAFT_FLAG \
+            --base flex \
+            --head "$BRANCH" \
+            --title "chore: upstream-sync flex onto ${TARGET_REF}" \
+            --body-file "$BODY_FILE"
