@@ -34,7 +34,7 @@ jobs:
         with:
           ref: flex
           fetch-depth: 0
-          token: ${{ secrets.SYNC_PAT }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git and fetch upstream tags
         run: |
@@ -189,7 +189,7 @@ jobs:
       - name: Push throwaway branch and open PR
         if: steps.decide.outputs.sync == 'true'
         env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.branch.outputs.branch }}
           MANUAL_COUNT: ${{ steps.rebase.outputs.manual_count }}
           TARGET: ${{ steps.target.outputs.target }}
