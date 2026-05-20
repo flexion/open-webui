@@ -4,7 +4,7 @@ import sys
 from typing import TYPE_CHECKING
 
 from loguru import logger
-from opentelemetry import trace
+
 from open_webui.env import (
     ENABLE_AUDIT_STDOUT,
     ENABLE_AUDIT_LOGS_FILE,
@@ -100,6 +100,8 @@ class InterceptHandler(logging.Handler):
         if not ENABLE_OTEL:
             return {}
 
+        from opentelemetry import trace
+
         extras = {}
         context = trace.get_current_span().get_span_context()
         if context.is_valid:
@@ -150,7 +152,7 @@ def start_logger():
     """
     logger.remove()
 
-    audit_filter = lambda record: (True if ENABLE_AUDIT_STDOUT else 'auditable' not in record['extra'])
+    audit_filter = lambda record: True if ENABLE_AUDIT_STDOUT else 'auditable' not in record['extra']
     if LOG_FORMAT == 'json':
         logger.add(
             _json_sink,

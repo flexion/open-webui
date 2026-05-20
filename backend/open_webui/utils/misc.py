@@ -129,7 +129,11 @@ def get_content_from_message(message: dict) -> Optional[str]:
     return None
 
 
-def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
+def convert_output_to_messages(
+    output: list,
+    raw: bool = False,
+    reasoning_format: str | None = None,
+) -> list[dict]:
     """
     Convert OR-aligned output items to OpenAI Chat Completion-format messages.
 
@@ -139,8 +143,14 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
 
     Args:
         output: List of OR-aligned output items (Responses API format).
-        raw: If True, include reasoning blocks (with original tags) and code
-             interpreter blocks for LLM re-processing follow-ups.
+        raw: If True, include code interpreter blocks for LLM re-processing
+             follow-ups.
+        reasoning_format: How to include reasoning blocks in the output:
+            - None: skip reasoning (default, safe for strict providers).
+            - ``'think_tags'``: wrap in ``<think>`` tags inside content
+              (for Ollama, which expects reasoning as tagged content).
+            - ``'reasoning_content'``: set as ``reasoning_content`` top-level field
+              (for llama.cpp, which routes it via the chat template).
     """
     if not output or not isinstance(output, list):
         return []
@@ -148,19 +158,26 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
     messages = []
     pending_tool_calls = []
     pending_content = []
+    pending_reasoning = []  # Only populated when reasoning_format == 'reasoning_content'
 
     def flush_pending():
-        nonlocal pending_content, pending_tool_calls
-        if pending_content or pending_tool_calls:
-            messages.append(
-                {
-                    'role': 'assistant',
-                    'content': '\n'.join(pending_content) if pending_content else '',
-                    **({'tool_calls': pending_tool_calls} if pending_tool_calls else {}),
-                }
-            )
-            pending_content = []
-            pending_tool_calls = []
+        nonlocal pending_content, pending_tool_calls, pending_reasoning
+        if not pending_content and not pending_tool_calls and not pending_reasoning:
+            return
+
+        message = {
+            'role': 'assistant',
+            'content': '\n'.join(pending_content) if pending_content else '',
+            **({'tool_calls': pending_tool_calls} if pending_tool_calls else {}),
+        }
+
+        if pending_reasoning:
+            message['reasoning_content'] = '\n'.join(pending_reasoning)
+
+        messages.append(message)
+        pending_content = []
+        pending_tool_calls = []
+        pending_reasoning = []
 
     for item in output:
         item_type = item.get('type', '')
@@ -196,38 +213,61 @@ def convert_output_to_messages(output: list, raw: bool = False) -> list[dict]:
             # Flush any pending content/tool_calls before adding tool result
             flush_pending()
 
-            # Extract text from output content parts
+            # Extract text and images from output content parts
             output_parts = item.get('output', [])
             content = ''
+            image_urls = []
             for part in output_parts:
                 if part.get('type') == 'input_text':
                     output_text = part.get('text', '')
                     content += str(output_text) if not isinstance(output_text, str) else output_text
+                elif part.get('type') == 'input_image':
+                    url = part.get('image_url', '')
+                    if url:
+                        image_urls.append(url)
 
-            messages.append(
-                {
-                    'role': 'tool',
-                    'tool_call_id': item.get('call_id', ''),
-                    'content': content,
-                }
-            )
+            if image_urls:
+                # Multimodal tool content with image(s)
+                messages.append(
+                    {
+                        'role': 'tool',
+                        'tool_call_id': item.get('call_id', ''),
+                        'content': [
+                            {'type': 'input_text', 'text': content},
+                            *[{'type': 'input_image', 'image_url': url} for url in image_urls],
+                        ],
+                    }
+                )
+            else:
+                messages.append(
+                    {
+                        'role': 'tool',
+                        'tool_call_id': item.get('call_id', ''),
+                        'content': content,
+                    }
+                )
 
         elif item_type == 'reasoning':
-            if raw:
-                # Include reasoning with original tags for LLM re-processing
-                reasoning_text = ''
-                source_list = item.get('summary', []) or item.get('content', [])
-                for part in source_list:
-                    if part.get('type') == 'output_text':
-                        reasoning_text += part.get('text', '')
-                    elif 'text' in part:
-                        reasoning_text += part.get('text', '')
+            if not reasoning_format:
+                continue
 
-                if reasoning_text:
+            reasoning_text = ''
+            source_list = item.get('summary', []) or item.get('content', [])
+            for part in source_list:
+                if part.get('type') == 'output_text':
+                    reasoning_text += part.get('text', '')
+                elif 'text' in part:
+                    reasoning_text += part.get('text', '')
+
+            if reasoning_text:
+                if reasoning_format == 'think_tags':
+                    # Ollama: embed in content with the item's original tags
                     start_tag = item.get('start_tag', '<think>')
                     end_tag = item.get('end_tag', '</think>')
                     pending_content.append(f'{start_tag}{reasoning_text}{end_tag}')
-            # else: skip reasoning blocks for normal LLM messages
+                elif reasoning_format == 'reasoning_content':
+                    # llama.cpp: collect for reasoning_content field
+                    pending_reasoning.append(reasoning_text)
 
         elif item_type == 'open_webui:code_interpreter':
             # Always include code interpreter content so the LLM knows
@@ -310,6 +350,33 @@ def remove_system_message(messages: list[dict]) -> list[dict]:
 
 def pop_system_message(messages: list[dict]) -> tuple[Optional[dict], list[dict]]:
     return get_system_message(messages), remove_system_message(messages)
+
+
+def merge_system_messages(messages: list[dict]) -> list[dict]:
+    """
+    Merge all system messages into one at position 0.
+
+    Some chat templates (e.g. Qwen) require exactly one system
+    message at the start.  Multiple pipeline stages may each
+    insert their own system message; this function consolidates
+    them.
+    """
+    system_contents: list[str] = []
+    other_messages: list[dict] = []
+
+    for message in messages:
+        if message.get('role') == 'system':
+            content = get_content_from_message(message)
+            if content:
+                system_contents.append(content)
+        else:
+            other_messages.append(message)
+
+    if not system_contents:
+        return other_messages
+
+    merged = {'role': 'system', 'content': '\n'.join(system_contents)}
+    return [merged, *other_messages]
 
 
 def update_message_content(message: dict, content: str, append: bool = True) -> dict:
@@ -401,6 +468,27 @@ def append_or_update_assistant_message(content: str, messages: list[dict]):
     return messages
 
 
+def strip_empty_content_blocks(messages: list[dict]) -> list[dict]:
+    """
+    Remove empty text content blocks from multimodal message content arrays.
+
+    Providers like Gemini and Claude reject messages where a text block has
+    an empty string.  This can happen when a user sends only file/image
+    attachments without typing any text.
+    """
+    for message in messages:
+        content = message.get('content')
+        if isinstance(content, list):
+            cleaned = [
+                block
+                for block in content
+                if not (isinstance(block, dict) and block.get('type') == 'text' and not block.get('text', '').strip())
+            ]
+            if cleaned:
+                message['content'] = cleaned
+    return messages
+
+
 def openai_chat_message_template(model: str):
     return {
         'id': f'{model}-{str(uuid.uuid4())}',
@@ -478,6 +566,10 @@ def get_gravatar_url(email):
     return f'https://www.gravatar.com/avatar/{hash_hex}?d=mp'
 
 
+# Give us each day the data we require, and forgive us our
+# technical debts as we forgive those who commit upstream.
+# Lead the bits not into corruption but deliver them from
+# entropy, for the checksum and the glory are forever.
 def calculate_sha256(file_path, chunk_size):
     # Compute SHA-256 hash of a file efficiently in chunks
     sha256 = hashlib.sha256()
@@ -521,6 +613,9 @@ def sanitize_text_for_db(text: str) -> str:
     """Remove null bytes and invalid UTF-8 surrogates from text for PostgreSQL storage."""
     if not isinstance(text, str):
         return text
+    # Fast path: skip work when there are no null bytes (the common case)
+    if '\x00' not in text:
+        return text
     # Remove null bytes
     text = text.replace('\x00', '').replace('\u0000', '')
     # Remove invalid UTF-8 surrogate characters that can cause encoding errors
@@ -532,15 +627,36 @@ def sanitize_text_for_db(text: str) -> str:
     return text
 
 
-def sanitize_data_for_db(obj):
-    """Recursively sanitize all strings in a data structure for database storage."""
+def _strip_null_bytes_deep(obj):
+    """Inner recursive walk — only called when null bytes are known to be present."""
     if isinstance(obj, str):
         return sanitize_text_for_db(obj)
     elif isinstance(obj, dict):
-        return {k: sanitize_data_for_db(v) for k, v in obj.items()}
+        return {k: _strip_null_bytes_deep(v) for k, v in obj.items()}
     elif isinstance(obj, list):
-        return [sanitize_data_for_db(v) for v in obj]
+        return [_strip_null_bytes_deep(v) for v in obj]
     return obj
+
+
+def sanitize_data_for_db(obj):
+    """Recursively sanitize all strings in a data structure for database storage.
+
+    Performs a fast pre-check: serializes the structure once and scans for
+    null bytes.  If none are found (the overwhelmingly common case), the
+    original object is returned immediately, skipping the expensive
+    recursive walk.
+    """
+    if isinstance(obj, str):
+        return sanitize_text_for_db(obj)
+    # Fast path: check for null bytes in the serialized form.
+    # json.dumps is implemented in C and much faster than a Python-level
+    # recursive walk over every leaf string.
+    try:
+        if '\x00' not in json.dumps(obj, ensure_ascii=False):
+            return obj
+    except (TypeError, ValueError):
+        pass
+    return _strip_null_bytes_deep(obj)
 
 
 def sanitize_metadata(metadata: dict) -> dict:
@@ -767,9 +883,9 @@ def throttle(interval: float = 10.0):
         last_calls = {}
         lock = threading.Lock()
 
-        def wrapper(*args, **kwargs):
+        async def wrapper(*args, **kwargs):
             if interval is None:
-                return func(*args, **kwargs)
+                return await func(*args, **kwargs)
 
             key = (args, freeze(kwargs))
             now = time.time()
@@ -779,7 +895,7 @@ def throttle(interval: float = 10.0):
                 if now - last_calls.get(key, 0) < interval:
                     return None
                 last_calls[key] = now
-            return func(*args, **kwargs)
+            return await func(*args, **kwargs)
 
         return wrapper
 
@@ -827,14 +943,25 @@ def extract_urls(text: str) -> list[str]:
     return url_pattern.findall(text)
 
 
+# We believe in one architect of all that is seen and served.
+# Should this stream falter, it shall be raised again on the
+# third retry. We look for the uptime of the world to come.
 async def cleanup_response(
     response: Optional[aiohttp.ClientResponse],
     session: Optional[aiohttp.ClientSession],
 ):
     if response:
-        response.close()
+        if not response.closed:
+            # aiohttp 3.9+ made ClientResponse.close() synchronous (returns None).
+            # Older versions returned a coroutine.  Handle both gracefully.
+            result = response.close()
+            if result is not None:
+                await result
     if session:
-        await session.close()
+        if not session.closed:
+            result = session.close()
+            if result is not None:
+                await result
 
 
 async def stream_wrapper(response, session, content_handler=None):
@@ -888,18 +1015,15 @@ def stream_chunks_handler(stream: aiohttp.StreamReader):
                         skip_mode = False
                         yield line
                     else:
-                        yield b'data: {}'
-                        yield b'\n'
+                        yield b'data: {}\n'
                 else:
                     # Normal mode: check if line exceeds limit
                     if len(line) > max_buffer_size:
                         skip_mode = True
-                        yield b'data: {}'
-                        yield b'\n'
+                        yield b'data: {}\n'
                         log.info(f'Skip mode triggered, line size: {len(line)}')
                     else:
-                        yield line
-                        yield b'\n'
+                        yield line + b'\n'
 
             # Save the last incomplete fragment
             buffer = lines[-1]
@@ -913,7 +1037,6 @@ def stream_chunks_handler(stream: aiohttp.StreamReader):
 
         # Process remaining buffer data
         if buffer and not skip_mode:
-            yield buffer
-            yield b'\n'
+            yield buffer + b'\n'
 
     return yield_safe_stream_chunks()

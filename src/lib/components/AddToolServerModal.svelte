@@ -58,6 +58,10 @@
 
 	let oauthClientInfo = null;
 
+	let oauthClientId = '';
+	let oauthClientSecret = '';
+	let oauthServerUrl = '';
+
 	let enable = true;
 	let loading = false;
 	let showAdvanced = false;
@@ -75,14 +79,28 @@
 			return;
 		}
 
-		const res = await registerOAuthClient(
-			localStorage.token,
-			{
-				url: url,
-				client_id: id
-			},
-			'mcp'
-		).catch((err) => {
+		if (auth_type === 'oauth_2.1_static' && (!oauthClientId || !oauthClientSecret)) {
+			toast.error($i18n.t('Please enter Client ID and Client Secret'));
+			return;
+		}
+
+		// client_id is the tool server ID (used as the internal lookup key for both flows).
+		// For static, client_secret signals the backend to use the static credential path.
+		// The actual OAuth client_id/secret come from the connection info at save time.
+		const formData: {
+			url: string;
+			client_id: string;
+			client_secret?: string;
+			oauth_server_url?: string;
+		} = {
+			url: url,
+			client_id: id,
+			...(auth_type === 'oauth_2.1_static'
+				? { client_secret: oauthClientSecret, oauth_server_url: oauthServerUrl }
+				: {})
+		};
+
+		const res = await registerOAuthClient(localStorage.token, formData, 'mcp').catch((err) => {
 			toast.error($i18n.t('Registration failed'));
 			return null;
 		});
@@ -267,7 +285,11 @@
 			return;
 		}
 
-		if (type === 'mcp' && auth_type === 'oauth_2.1' && !oauthClientInfo) {
+		if (
+			type === 'mcp' &&
+			['oauth_2.1', 'oauth_2.1_static'].includes(auth_type) &&
+			!oauthClientInfo
+		) {
 			toast.error($i18n.t('Please register the OAuth client'));
 			loading = false;
 			return;
@@ -320,7 +342,14 @@
 				id: id,
 				name: name,
 				description: description,
-				...(oauthClientInfo ? { oauth_client_info: oauthClientInfo } : {})
+				...(oauthClientInfo ? { oauth_client_info: oauthClientInfo } : {}),
+				...(auth_type === 'oauth_2.1_static'
+					? {
+							oauth_client_id: oauthClientId,
+							oauth_client_secret: oauthClientSecret,
+							oauth_server_url: oauthServerUrl
+						}
+					: {})
 			}
 		};
 
@@ -345,6 +374,9 @@
 		description = '';
 
 		oauthClientInfo = null;
+		oauthClientId = '';
+		oauthClientSecret = '';
+		oauthServerUrl = '';
 
 		enable = true;
 		functionNameFilterList = '';
@@ -369,6 +401,9 @@
 			name = connection.info?.name ?? '';
 			description = connection.info?.description ?? '';
 			oauthClientInfo = connection.info?.oauth_client_info ?? null;
+			oauthClientId = connection.info?.oauth_client_id ?? '';
+			oauthClientSecret = connection.info?.oauth_client_secret ?? '';
+			oauthServerUrl = connection.info?.oauth_server_url ?? '';
 
 			enable = connection.config?.enable ?? true;
 			functionNameFilterList = connection.config?.function_name_filter_list ?? '';
@@ -607,7 +642,7 @@
 										</div>
 									</div>
 
-									{#if auth_type === 'oauth_2.1'}
+									{#if ['oauth_2.1', 'oauth_2.1_static'].includes(auth_type)}
 										<div class="flex items-center gap-2">
 											<div class="flex flex-col justify-end items-center shrink-0">
 												<Tooltip
@@ -660,6 +695,7 @@
 												<option value="system_oauth">{$i18n.t('OAuth')}</option>
 												{#if type === 'mcp'}
 													<option value="oauth_2.1">{$i18n.t('OAuth 2.1')}</option>
+													<option value="oauth_2.1_static">{$i18n.t('OAuth 2.1 (Static)')}</option>
 												{/if}
 											{/if}
 										</select>
@@ -695,6 +731,28 @@
 												class={`flex items-center text-xs self-center translate-y-[1px] ${($settings?.highContrastMode ?? false) ? 'text-gray-800 dark:text-gray-100' : 'text-gray-500'}`}
 											>
 												{$i18n.t('Uses OAuth 2.1 Dynamic Client Registration')}
+											</div>
+										{:else if auth_type === 'oauth_2.1_static'}
+											<div class="flex flex-col gap-1.5 w-full mt-0.5">
+												<SensitiveInput
+													bind:value={oauthClientId}
+													placeholder={$i18n.t('Client ID')}
+													required={false}
+												/>
+												<SensitiveInput
+													bind:value={oauthClientSecret}
+													placeholder={$i18n.t('Client Secret')}
+													required={false}
+												/>
+												<div class="flex flex-1 items-center">
+													<input
+														class={`w-full text-sm bg-transparent ${($settings?.highContrastMode ?? false) ? 'placeholder:text-gray-700 dark:placeholder:text-gray-100' : 'outline-hidden placeholder:text-gray-300 dark:placeholder:text-gray-700'}`}
+														type="text"
+														bind:value={oauthServerUrl}
+														placeholder={$i18n.t('OAuth Server URL')}
+														autocomplete="off"
+													/>
+												</div>
 											</div>
 										{/if}
 									</div>
@@ -847,7 +905,7 @@
 						{/if}
 
 						{#if !direct}
-							<hr class=" border-gray-100 dark:border-gray-700/10 my-2.5 w-full" />
+							<hr class=" border-gray-100/50 dark:border-gray-700/10 my-2.5 w-full" />
 
 							<div class="flex flex-col w-full mt-2">
 								<label
@@ -872,7 +930,7 @@
 
 					{#if type === 'mcp'}
 						<div
-							class=" bg-yellow-500/20 text-yellow-700 dark:text-yellow-200 rounded-2xl text-xs px-4 py-3 mb-2"
+							class=" bg-yellow-500/20 text-yellow-700 dark:text-yellow-200 rounded-2xl text-xs px-4 py-3 mb-2 mt-1"
 						>
 							<span class="font-medium">
 								{$i18n.t('Warning')}:
@@ -881,10 +939,8 @@
 								'MCP support is experimental and its specification changes often, which can lead to incompatibilities. OpenAPI specification support is directly maintained by the Open WebUI team, making it the more reliable option for compatibility.'
 							)}
 
-							<a
-								class="font-medium underline"
-								href="https://docs.openwebui.com/features/mcp"
-								target="_blank">{$i18n.t('Read more →')}</a
+							<a class="font-medium underline" href="https://docs.openwebui.com/" target="_blank"
+								>{$i18n.t('Read more →')}</a
 							>
 						</div>
 					{/if}
@@ -930,7 +986,9 @@
 
 <ConfirmDialog
 	bind:show={showDeleteConfirmDialog}
-	message={$i18n.t('Are you sure you want to delete this connection? This action cannot be undone.')}
+	message={$i18n.t(
+		'Are you sure you want to delete this connection? This action cannot be undone.'
+	)}
 	confirmLabel={$i18n.t('Delete')}
 	on:confirm={() => {
 		onDelete();

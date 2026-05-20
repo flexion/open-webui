@@ -9,7 +9,7 @@ class MESSAGES(str, Enum):
 
 class WEBHOOK_MESSAGES(str, Enum):
     DEFAULT = lambda msg='': f'{msg if msg else ""}'
-    USER_SIGNUP = lambda username='': (f'New user signed up: {username}' if username else 'New user signed up')
+    USER_SIGNUP = lambda username='': f'New user signed up: {username}' if username else 'New user signed up'
 
 
 class ERROR_MESSAGES(str, Enum):
@@ -80,8 +80,8 @@ class ERROR_MESSAGES(str, Enum):
 
     OLLAMA_API_DISABLED = 'The Ollama API is disabled. Please enable it to use this feature.'
 
-    FILE_TOO_LARGE = (
-        lambda size='': f"Oops! The file you're trying to upload is too large. Please upload a file that is less than {size}."
+    FILE_TOO_LARGE = lambda size='': (
+        f"Oops! The file you're trying to upload is too large. Please upload a file that is less than {size}."
     )
 
     DUPLICATE_CONTENT = 'Duplicate content detected. Please provide unique content to proceed.'
@@ -89,7 +89,18 @@ class ERROR_MESSAGES(str, Enum):
         'Extracted content is not available for this file. Please ensure that the file is processed before proceeding.'
     )
 
-    INVALID_PASSWORD = lambda err='': (err if err else 'The password does not meet the required validation criteria.')
+    INVALID_PASSWORD = lambda err='': err if err else 'The password does not meet the required validation criteria.'
+
+    AUTOMATION_LIMIT_EXCEEDED = lambda size='': f'Automation limit reached ({size})'
+    AUTOMATION_TOO_FREQUENT = lambda interval='': f'Schedule too frequent. Minimum interval is {interval} seconds.'
+    AUTOMATION_INVALID_RRULE = lambda err='': f'Invalid RRULE: {err}'
+    AUTOMATION_NO_FUTURE_RUNS = 'RRULE has no future occurrences'
+
+    FEATURE_DISABLED = lambda name='': f'{name} is disabled'
+    INPUT_TOO_LONG = lambda size='': f'Input prompt exceeds maximum length of {size}'
+    SERVER_CONNECTION_ERROR = 'Open WebUI: Server Connection Error'
+    REQUIRED_FIELD_EMPTY = lambda name='': f'Required field {name} is empty'
+    OAUTH_NOT_CONFIGURED = lambda name='': f"Provider '{name}' is not configured"
 
 
 class TASKS(str, Enum):
@@ -106,3 +117,4 @@ class TASKS(str, Enum):
     AUTOCOMPLETE_GENERATION = 'autocomplete_generation'
     FUNCTION_CALLING = 'function_calling'
     MOA_RESPONSE_GENERATION = 'moa_response_generation'
+    MODEL_RECOMMENDATION = 'model_recommendation'

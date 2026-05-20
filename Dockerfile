@@ -43,7 +43,7 @@ ENV APP_BUILD_HASH=${BUILD_HASH}
 RUN npm run build
 
 ######## WebUI backend ########
-FROM python:3.11.14-slim-bookworm AS base
+FROM python:3.11-slim-bookworm AS base
 
 # Use args
 ARG USE_CUDA
@@ -135,7 +135,20 @@ RUN apt-get update && \
 # install python dependencies
 COPY --chown=$UID:$GID ./backend/requirements.txt ./requirements.txt
 
+# Set UV_LINK_MODE to copy to prevent 0-byte file corruption in QEMU arm64 cross-builds
+ENV UV_LINK_MODE=copy
+
 RUN set -e; \
+    # Strip IPv6 CIDR entries from no_proxy — OrbStack injects ranges like fd07:b51a:cc66::/64
+    # that httpx cannot parse as URL patterns, causing build failures during model downloads.
+    if [ -n "$no_proxy" ]; then \
+        no_proxy=$(echo "$no_proxy" | tr ',' '\n' | grep -v ':.*/' | tr '\n' ',' | sed 's/,$//'); \
+        export no_proxy; \
+    fi; \
+    if [ -n "$NO_PROXY" ]; then \
+        NO_PROXY=$(echo "$NO_PROXY" | tr ',' '\n' | grep -v ':.*/' | tr '\n' ',' | sed 's/,$//'); \
+        export NO_PROXY; \
+    fi; \
     pip3 install --no-cache-dir uv; \
     if [ "$USE_CUDA" = "true" ]; then \
     # If you use CUDA the whisper and embedding model will be downloaded on first use

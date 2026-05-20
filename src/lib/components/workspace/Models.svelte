@@ -256,7 +256,9 @@
 		});
 		models = models;
 		// Sync with server
-		await Promise.all(modelsToShow.map((model) => updateModelById(localStorage.token, model.id, model)));
+		await Promise.all(
+			modelsToShow.map((model) => updateModelById(localStorage.token, model.id, model))
+		);
 		toast.success($i18n.t('All models are now visible'));
 	};
 
@@ -268,7 +270,9 @@
 		});
 		models = models;
 		// Sync with server
-		await Promise.all(modelsToHide.map((model) => updateModelById(localStorage.token, model.id, model)));
+		await Promise.all(
+			modelsToHide.map((model) => updateModelById(localStorage.token, model.id, model))
+		);
 		toast.success($i18n.t('All models are now hidden'));
 	};
 
@@ -468,7 +472,6 @@
 						</button>
 					</div>
 				{/if}
-
 			</div>
 		</div>
 
@@ -598,6 +601,8 @@
 												src={`${WEBUI_API_BASE_URL}/models/model/profile/image?id=${model.id}&lang=${$i18n.language}`}
 												alt="modelfile profile"
 												class=" rounded-2xl size-12 object-cover"
+												loading="lazy"
+												decoding="async"
 												on:error={(e) => {
 													e.target.src = '/favicon.png';
 												}}

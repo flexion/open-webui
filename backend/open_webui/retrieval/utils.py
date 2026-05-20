@@ -20,6 +20,7 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
 from open_webui.config import VECTOR_DB
+from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 
 
@@ -30,6 +31,7 @@ from open_webui.models.knowledge import Knowledges
 from open_webui.models.chats import Chats
 from open_webui.models.notes import Notes
 from open_webui.models.access_grants import AccessGrants
+from open_webui.utils.access_control.files import has_access_to_file
 
 from open_webui.retrieval.vector.main import GetResult
 from open_webui.utils.headers import include_user_info_headers
@@ -41,6 +43,7 @@ from open_webui.retrieval.loaders.youtube import YoutubeLoader
 
 from open_webui.env import (
     AIOHTTP_CLIENT_TIMEOUT,
+    AIOHTTP_CLIENT_ALLOW_REDIRECTS,
     OFFLINE_MODE,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     AIOHTTP_CLIENT_SESSION_SSL,
@@ -81,11 +84,129 @@ def get_loader(request, url: str):
         )
 
 
+def build_loader_from_config(request):
+    """Build a Loader instance with the admin's configured extraction engine settings."""
+    from open_webui.retrieval.loaders.main import Loader
+
+    config = request.app.state.config
+    return Loader(
+        engine=config.CONTENT_EXTRACTION_ENGINE,
+        DATALAB_MARKER_API_KEY=config.DATALAB_MARKER_API_KEY,
+        DATALAB_MARKER_API_BASE_URL=config.DATALAB_MARKER_API_BASE_URL,
+        DATALAB_MARKER_ADDITIONAL_CONFIG=config.DATALAB_MARKER_ADDITIONAL_CONFIG,
+        DATALAB_MARKER_SKIP_CACHE=config.DATALAB_MARKER_SKIP_CACHE,
+        DATALAB_MARKER_FORCE_OCR=config.DATALAB_MARKER_FORCE_OCR,
+        DATALAB_MARKER_PAGINATE=config.DATALAB_MARKER_PAGINATE,
+        DATALAB_MARKER_STRIP_EXISTING_OCR=config.DATALAB_MARKER_STRIP_EXISTING_OCR,
+        DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION=config.DATALAB_MARKER_DISABLE_IMAGE_EXTRACTION,
+        DATALAB_MARKER_FORMAT_LINES=config.DATALAB_MARKER_FORMAT_LINES,
+        DATALAB_MARKER_USE_LLM=config.DATALAB_MARKER_USE_LLM,
+        DATALAB_MARKER_OUTPUT_FORMAT=config.DATALAB_MARKER_OUTPUT_FORMAT,
+        EXTERNAL_DOCUMENT_LOADER_URL=config.EXTERNAL_DOCUMENT_LOADER_URL,
+        EXTERNAL_DOCUMENT_LOADER_API_KEY=config.EXTERNAL_DOCUMENT_LOADER_API_KEY,
+        TIKA_SERVER_URL=config.TIKA_SERVER_URL,
+        DOCLING_SERVER_URL=config.DOCLING_SERVER_URL,
+        DOCLING_API_KEY=config.DOCLING_API_KEY,
+        DOCLING_PARAMS=config.DOCLING_PARAMS,
+        PDF_EXTRACT_IMAGES=config.PDF_EXTRACT_IMAGES,
+        PDF_LOADER_MODE=config.PDF_LOADER_MODE,
+        DOCUMENT_INTELLIGENCE_ENDPOINT=config.DOCUMENT_INTELLIGENCE_ENDPOINT,
+        DOCUMENT_INTELLIGENCE_KEY=config.DOCUMENT_INTELLIGENCE_KEY,
+        DOCUMENT_INTELLIGENCE_MODEL=config.DOCUMENT_INTELLIGENCE_MODEL,
+        MISTRAL_OCR_API_BASE_URL=config.MISTRAL_OCR_API_BASE_URL,
+        MISTRAL_OCR_API_KEY=config.MISTRAL_OCR_API_KEY,
+        PADDLEOCR_VL_BASE_URL=config.PADDLEOCR_VL_BASE_URL,
+        PADDLEOCR_VL_TOKEN=config.PADDLEOCR_VL_TOKEN,
+        MINERU_API_MODE=config.MINERU_API_MODE,
+        MINERU_API_URL=config.MINERU_API_URL,
+        MINERU_API_KEY=config.MINERU_API_KEY,
+        MINERU_API_TIMEOUT=config.MINERU_API_TIMEOUT,
+        MINERU_PARAMS=config.MINERU_PARAMS,
+    )
+
+
+def _extract_text_from_binary_response(request, response: requests.Response, url: str) -> tuple[str, list]:
+    """Download response body to a temp file and extract text using the Loader pipeline."""
+    import mimetypes
+    import tempfile
+    import urllib.parse
+
+    content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+
+    # Derive filename from URL path, falling back to Content-Disposition or mime guess
+    url_path = urllib.parse.urlparse(url).path
+    filename = os.path.basename(url_path) if url_path else ''
+
+    if not filename or '.' not in filename:
+        # Try Content-Disposition header
+        cd = response.headers.get('Content-Disposition', '')
+        if 'filename=' in cd:
+            filename = cd.split('filename=')[-1].strip('"\'')
+
+    if not filename or '.' not in filename:
+        ext = mimetypes.guess_extension(content_type) or ''
+        filename = f'download{ext}'
+
+    suffix = '.' + filename.split('.')[-1].lower() if '.' in filename else ''
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(response.content)
+        tmp_path = tmp.name
+
+    try:
+        loader = build_loader_from_config(request)
+        docs = loader.load(filename, content_type, tmp_path)
+        for doc in docs:
+            doc.metadata['source'] = url
+        content = ' '.join([doc.page_content for doc in docs])
+        return content, docs
+    finally:
+        os.remove(tmp_path)
+
+
+def _is_text_content_type(content_type: str) -> bool:
+    """Return True if the content type should be handled by the web loader."""
+    ct = content_type.split(';')[0].strip().lower()
+    if ct.startswith('text/'):
+        return True
+    if any(t in ct for t in ['xml', 'json', 'javascript']):
+        return True
+    return not ct  # empty / missing → assume HTML
+
+
 def get_content_from_url(request, url: str) -> str:
-    loader = get_loader(request, url)
-    docs = loader.load()
-    content = ' '.join([doc.page_content for doc in docs])
-    return content, docs
+    from open_webui.retrieval.web.utils import validate_url
+
+    # Validate URL before making any request (blocks private IPs, non-HTTP, filter list)
+    validate_url(url)
+
+    # Streamed GET to check Content-Type without downloading the body.
+    # allow_redirects=False prevents redirect-based SSRF: validate_url() above is
+    # called on the originally-submitted URL only; following 3xx redirects without
+    # re-validation would let an attacker reach private IPs (RFC1918, loopback,
+    # cloud-metadata 169.254.169.254) via a public host that redirects internally.
+    try:
+        response = requests.get(url, stream=True, timeout=30, allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS)
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', '')
+    except Exception:
+        content_type = ''
+        response = None
+
+    # Text / HTML / unknown — use the configured web loader
+    if response is None or _is_text_content_type(content_type):
+        if response is not None:
+            response.close()
+        loader = get_loader(request, url)
+        docs = loader.load()
+        content = ' '.join([doc.page_content for doc in docs])
+        return content, docs
+
+    # Binary content (PDF, DOCX, XLSX, PPTX, etc.) — download and extract
+    try:
+        return _extract_text_from_binary_response(request, response, url)
+    finally:
+        response.close()
 
 
 CHUNK_HASH_KEY = '_chunk_hash'
@@ -120,7 +241,7 @@ class VectorSearchRetriever(BaseRetriever):
         run_manager: CallbackManagerForRetrieverRun,
     ) -> list[Document]:
         embedding = await self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)
-        result = VECTOR_DB_CLIENT.search(
+        result = await ASYNC_VECTOR_DB_CLIENT.search(
             collection_name=self.collection_name,
             vectors=[embedding],
             limit=self.top_k,
@@ -404,11 +525,34 @@ def get_all_items_from_collections(collection_names: list[str]) -> dict:
 
 
 async def query_collection(
+    request,
     collection_names: list[str],
     queries: list[str],
     embedding_function,
     k: int,
 ) -> dict:
+    # When request is provided, try hybrid search + reranking if enabled
+    if request and request.app.state.config.ENABLE_RAG_HYBRID_SEARCH:
+        try:
+            reranking_function = (
+                (lambda query, documents: request.app.state.RERANKING_FUNCTION(query, documents))
+                if request.app.state.RERANKING_FUNCTION
+                else None
+            )
+            return await query_collection_with_hybrid_search(
+                collection_names=collection_names,
+                queries=queries,
+                embedding_function=embedding_function,
+                k=k,
+                reranking_function=reranking_function,
+                k_reranker=request.app.state.config.TOP_K_RERANKER,
+                r=request.app.state.config.RELEVANCE_THRESHOLD,
+                hybrid_bm25_weight=request.app.state.config.HYBRID_BM25_WEIGHT,
+                enable_enriched_texts=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS,
+            )
+        except Exception as e:
+            log.debug(f'Hybrid search failed, falling back to vector search: {e}')
+
     results = []
     error = False
 
@@ -426,6 +570,13 @@ async def query_collection(
         except Exception as e:
             log.exception(f'Error when querying the collection: {e}')
             return None, e
+
+    # Sanitize: filter out None/empty queries to prevent embedding crashes
+    # (e.g. when get_last_user_message returns None)
+    queries = [q for q in queries if q]
+    if not queries:
+        log.warning('query_collection: all queries were None or empty, returning empty results')
+        return {'distances': [[]], 'documents': [[]], 'metadatas': [[]]}
 
     # Generate all query embeddings (in one call)
     query_embeddings = await embedding_function(queries, prefix=RAG_EMBEDDING_QUERY_PREFIX)
@@ -464,16 +615,24 @@ async def query_collection_with_hybrid_search(
 ) -> dict:
     results = []
     error = False
-    # Fetch collection data once per collection sequentially
-    # Avoid fetching the same data multiple times later
-    collection_results = {}
-    for collection_name in collection_names:
+    # Fetch every collection's contents once up front so the
+    # per-query/per-document loop below can reuse them. Each fetch
+    # offloads to a worker thread, so run them concurrently with
+    # `asyncio.gather` instead of awaiting them serially — otherwise
+    # latency scales linearly with `len(collection_names)`.
+    log.debug(
+        'query_collection_with_hybrid_search: prefetching %d collections',
+        len(collection_names),
+    )
+
+    async def _fetch_collection(name: str):
         try:
-            log.debug(f'query_collection_with_hybrid_search:VECTOR_DB_CLIENT.get:collection {collection_name}')
-            collection_results[collection_name] = VECTOR_DB_CLIENT.get(collection_name=collection_name)
+            return name, await ASYNC_VECTOR_DB_CLIENT.get(collection_name=name)
         except Exception as e:
-            log.exception(f'Failed to fetch collection {collection_name}: {e}')
-            collection_results[collection_name] = None
+            log.exception(f'Failed to fetch collection {name}: {e}')
+            return name, None
+
+    collection_results = dict(await asyncio.gather(*(_fetch_collection(name) for name in collection_names)))
 
     log.info(f'Starting hybrid search for {len(queries)} queries in {len(collection_names)} collections...')
 
@@ -527,34 +686,30 @@ def generate_openai_batch_embeddings(
     key: str = '',
     prefix: str = None,
     user: UserModel = None,
-) -> Optional[list[list[float]]]:
-    try:
-        log.debug(f'generate_openai_batch_embeddings:model {model} batch size: {len(texts)}')
-        json_data = {'input': texts, 'model': model}
-        if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
-            json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
+) -> list[list[float]]:
+    log.debug(f'generate_openai_batch_embeddings:model {model} batch size: {len(texts)}')
+    json_data = {'input': texts, 'model': model}
+    if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
+        json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {key}',
-        }
-        if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-            headers = include_user_info_headers(headers, user)
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {key}',
+    }
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
 
-        r = requests.post(
-            f'{url}/embeddings',
-            headers=headers,
-            json=json_data,
-        )
-        r.raise_for_status()
-        data = r.json()
-        if 'data' in data:
-            return [elem['embedding'] for elem in data['data']]
-        else:
-            raise ValueError("Unexpected OpenAI embeddings response: missing 'data' key")
-    except Exception as e:
-        log.exception(f'Error generating openai batch embeddings: {e}')
-        return None
+    r = requests.post(
+        f'{url}/embeddings',
+        headers=headers,
+        json=json_data,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if 'data' in data:
+        return [elem['embedding'] for elem in data['data']]
+    else:
+        raise ValueError("Unexpected OpenAI embeddings response: missing 'data' key")
 
 
 async def agenerate_openai_batch_embeddings(
@@ -564,38 +719,34 @@ async def agenerate_openai_batch_embeddings(
     key: str = '',
     prefix: str = None,
     user: UserModel = None,
-) -> Optional[list[list[float]]]:
-    try:
-        log.debug(f'agenerate_openai_batch_embeddings:model {model} batch size: {len(texts)}')
-        form_data = {'input': texts, 'model': model}
-        if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
-            form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
+) -> list[list[float]]:
+    log.debug(f'agenerate_openai_batch_embeddings:model {model} batch size: {len(texts)}')
+    form_data = {'input': texts, 'model': model}
+    if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
+        form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {key}',
-        }
-        if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-            headers = include_user_info_headers(headers, user)
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {key}',
+    }
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
 
-        async with aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        ) as session:
-            async with session.post(
-                f'{url}/embeddings',
-                headers=headers,
-                json=form_data,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as r:
-                r.raise_for_status()
-                data = await r.json()
-                if 'data' in data:
-                    return [item['embedding'] for item in data['data']]
-                else:
-                    raise Exception('Something went wrong :/')
-    except Exception as e:
-        log.exception(f'Error generating openai batch embeddings: {e}')
-        return None
+    async with aiohttp.ClientSession(
+        trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+    ) as session:
+        async with session.post(
+            f'{url}/embeddings',
+            headers=headers,
+            json=form_data,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        ) as r:
+            r.raise_for_status()
+            data = await r.json()
+            if 'data' in data:
+                return [item['embedding'] for item in data['data']]
+            else:
+                raise ValueError("Unexpected OpenAI embeddings response: missing 'data' key")
 
 
 def generate_azure_openai_batch_embeddings(
@@ -606,42 +757,38 @@ def generate_azure_openai_batch_embeddings(
     version: str = '',
     prefix: str = None,
     user: UserModel = None,
-) -> Optional[list[list[float]]]:
-    try:
-        log.debug(f'generate_azure_openai_batch_embeddings:deployment {model} batch size: {len(texts)}')
-        json_data = {'input': texts}
-        if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
-            json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
+) -> list[list[float]]:
+    log.debug(f'generate_azure_openai_batch_embeddings:deployment {model} batch size: {len(texts)}')
+    json_data = {'input': texts}
+    if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
+        json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-        url = f'{url}/openai/deployments/{model}/embeddings?api-version={version}'
+    url = f'{url}/openai/deployments/{model}/embeddings?api-version={version}'
 
-        for _ in range(5):
-            headers = {
-                'Content-Type': 'application/json',
-                'api-key': key,
-            }
-            if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-                headers = include_user_info_headers(headers, user)
+    for _ in range(5):
+        headers = {
+            'Content-Type': 'application/json',
+            'api-key': key,
+        }
+        if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+            headers = include_user_info_headers(headers, user)
 
-            r = requests.post(
-                url,
-                headers=headers,
-                json=json_data,
-            )
-            if r.status_code == 429:
-                retry = float(r.headers.get('Retry-After', '1'))
-                time.sleep(retry)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            if 'data' in data:
-                return [elem['embedding'] for elem in data['data']]
-            else:
-                raise Exception('Something went wrong :/')
-        return None
-    except Exception as e:
-        log.exception(f'Error generating azure openai batch embeddings: {e}')
-        return None
+        r = requests.post(
+            url,
+            headers=headers,
+            json=json_data,
+        )
+        if r.status_code == 429:
+            retry = float(r.headers.get('Retry-After', '1'))
+            time.sleep(retry)
+            continue
+        r.raise_for_status()
+        data = r.json()
+        if 'data' in data:
+            return [elem['embedding'] for elem in data['data']]
+        else:
+            raise ValueError("Unexpected Azure OpenAI embeddings response: missing 'data' key")
+    raise Exception('Azure OpenAI embedding request failed: max retries (429) exceeded')
 
 
 async def agenerate_azure_openai_batch_embeddings(
@@ -652,40 +799,36 @@ async def agenerate_azure_openai_batch_embeddings(
     version: str = '',
     prefix: str = None,
     user: UserModel = None,
-) -> Optional[list[list[float]]]:
-    try:
-        log.debug(f'agenerate_azure_openai_batch_embeddings:deployment {model} batch size: {len(texts)}')
-        form_data = {'input': texts}
-        if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
-            form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
+) -> list[list[float]]:
+    log.debug(f'agenerate_azure_openai_batch_embeddings:deployment {model} batch size: {len(texts)}')
+    form_data = {'input': texts}
+    if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
+        form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-        full_url = f'{url}/openai/deployments/{model}/embeddings?api-version={version}'
+    full_url = f'{url}/openai/deployments/{model}/embeddings?api-version={version}'
 
-        headers = {
-            'Content-Type': 'application/json',
-            'api-key': key,
-        }
-        if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-            headers = include_user_info_headers(headers, user)
+    headers = {
+        'Content-Type': 'application/json',
+        'api-key': key,
+    }
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
 
-        async with aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        ) as session:
-            async with session.post(
-                full_url,
-                headers=headers,
-                json=form_data,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as r:
-                r.raise_for_status()
-                data = await r.json()
-                if 'data' in data:
-                    return [item['embedding'] for item in data['data']]
-                else:
-                    raise Exception('Something went wrong :/')
-    except Exception as e:
-        log.exception(f'Error generating azure openai batch embeddings: {e}')
-        return None
+    async with aiohttp.ClientSession(
+        trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+    ) as session:
+        async with session.post(
+            full_url,
+            headers=headers,
+            json=form_data,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        ) as r:
+            r.raise_for_status()
+            data = await r.json()
+            if 'data' in data:
+                return [item['embedding'] for item in data['data']]
+            else:
+                raise ValueError("Unexpected Azure OpenAI embeddings response: missing 'data' key")
 
 
 def generate_ollama_batch_embeddings(
@@ -695,35 +838,33 @@ def generate_ollama_batch_embeddings(
     key: str = '',
     prefix: str = None,
     user: UserModel = None,
-) -> Optional[list[list[float]]]:
-    try:
-        log.debug(f'generate_ollama_batch_embeddings:model {model} batch size: {len(texts)}')
-        json_data = {'input': texts, 'model': model}
-        if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
-            json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
+) -> list[list[float]]:
+    log.debug(f'generate_ollama_batch_embeddings:model {model} batch size: {len(texts)}')
+    json_data = {'input': texts, 'model': model, 'truncate': True}
+    if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
+        json_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {key}',
-        }
-        if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-            headers = include_user_info_headers(headers, user)
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {key}',
+    }
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
 
-        r = requests.post(
-            f'{url}/api/embed',
-            headers=headers,
-            json=json_data,
-        )
-        r.raise_for_status()
-        data = r.json()
+    r = requests.post(
+        f'{url}/api/embed',
+        headers=headers,
+        json=json_data,
+    )
+    if r.status_code != 200:
+        error_detail = r.json().get('error', r.text)
+        raise Exception(f'Ollama embed error ({r.status_code}): {error_detail}')
+    data = r.json()
 
-        if 'embeddings' in data:
-            return data['embeddings']
-        else:
-            raise ValueError("Unexpected Ollama embeddings response: missing 'embeddings' key")
-    except Exception as e:
-        log.exception(f'Error generating ollama batch embeddings: {e}')
-        return None
+    if 'embeddings' in data:
+        return data['embeddings']
+    else:
+        raise ValueError("Unexpected Ollama embeddings response: missing 'embeddings' key")
 
 
 async def agenerate_ollama_batch_embeddings(
@@ -733,38 +874,37 @@ async def agenerate_ollama_batch_embeddings(
     key: str = '',
     prefix: str = None,
     user: UserModel = None,
-) -> Optional[list[list[float]]]:
-    try:
-        log.debug(f'agenerate_ollama_batch_embeddings:model {model} batch size: {len(texts)}')
-        form_data = {'input': texts, 'model': model}
-        if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
-            form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
+) -> list[list[float]]:
+    log.debug(f'agenerate_ollama_batch_embeddings:model {model} batch size: {len(texts)}')
+    form_data = {'input': texts, 'model': model, 'truncate': True}
+    if isinstance(RAG_EMBEDDING_PREFIX_FIELD_NAME, str) and isinstance(prefix, str):
+        form_data[RAG_EMBEDDING_PREFIX_FIELD_NAME] = prefix
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {key}',
-        }
-        if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-            headers = include_user_info_headers(headers, user)
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {key}',
+    }
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
 
-        async with aiohttp.ClientSession(
-            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-        ) as session:
-            async with session.post(
-                f'{url}/api/embed',
-                headers=headers,
-                json=form_data,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as r:
-                r.raise_for_status()
-                data = await r.json()
-                if 'embeddings' in data:
-                    return data['embeddings']
-                else:
-                    raise Exception('Something went wrong :/')
-    except Exception as e:
-        log.exception(f'Error generating ollama batch embeddings: {e}')
-        return None
+    async with aiohttp.ClientSession(
+        trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+    ) as session:
+        async with session.post(
+            f'{url}/api/embed',
+            headers=headers,
+            json=form_data,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+        ) as r:
+            if r.status != 200:
+                error_data = await r.json()
+                error_detail = error_data.get('error', str(error_data))
+                raise Exception(f'Ollama embed error ({r.status}): {error_detail}')
+            data = await r.json()
+            if 'embeddings' in data:
+                return data['embeddings']
+            else:
+                raise ValueError("Unexpected Ollama embeddings response: missing 'embeddings' key")
 
 
 def get_embedding_function(
@@ -832,11 +972,12 @@ def get_embedding_function(
                     for batch in batches:
                         batch_results.append(await embedding_function(batch, prefix=prefix, user=user))
 
-                # Flatten results
+                # Flatten results — raise if any batch failed
                 embeddings = []
-                for batch_embeddings in batch_results:
-                    if isinstance(batch_embeddings, list):
-                        embeddings.extend(batch_embeddings)
+                for i, batch_embeddings in enumerate(batch_results):
+                    if batch_embeddings is None:
+                        raise Exception(f'Embedding generation failed for batch {i + 1}/{len(batches)}')
+                    embeddings.extend(batch_embeddings)
 
                 log.debug(
                     f'generate_multiple_async: Generated {len(embeddings)} embeddings from {len(batches)} parallel batches'
@@ -878,11 +1019,15 @@ async def generate_embeddings(
                 'user': user,
             }
         )
+        if embeddings is None:
+            return None
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == 'openai':
         embeddings = await agenerate_openai_batch_embeddings(
             model, text if isinstance(text, list) else [text], url, key, prefix, user
         )
+        if embeddings is None:
+            return None
         return embeddings[0] if isinstance(text, str) else embeddings
     elif engine == 'azure_openai':
         azure_api_version = kwargs.get('azure_api_version', '')
@@ -895,10 +1040,12 @@ async def generate_embeddings(
             prefix,
             user,
         )
+        if embeddings is None:
+            return None
         return embeddings[0] if isinstance(text, str) else embeddings
 
 
-def get_reranking_function(reranking_engine, reranking_model, reranking_function):
+def get_reranking_function(reranking_engine, reranking_model, reranking_function, reranking_batch_size=32):
     if reranking_function is None:
         return None
     if reranking_engine == 'external':
@@ -907,8 +1054,59 @@ def get_reranking_function(reranking_engine, reranking_model, reranking_function
         )
     else:
         return lambda query, documents, user=None: reranking_function.predict(
-            [(query, doc.page_content) for doc in documents]
+            [(query, doc.page_content) for doc in documents], batch_size=int(reranking_batch_size)
         )
+
+
+async def filter_accessible_collections(
+    collection_names: set[str],
+    user: UserModel,
+    access_type: str = 'read',
+) -> set[str]:
+    """
+    Return only the collection names the user is allowed to access.
+    Admins bypass all checks.  For non-admins the policy is:
+
+      - file-*          → validated via has_access_to_file
+      - user-memory-*   → must match user's own memory collection
+      - web-search-*    → ephemeral per-query collections, always allowed
+      - knowledge-bases → always denied (system meta-collection)
+      - everything else → if the name matches a knowledge base, validated
+                          via Knowledges.check_access_by_user_id; if no
+                          such KB exists, the name is treated as an
+                          ephemeral/legacy collection and allowed
+    """
+    if user.role == 'admin':
+        return collection_names
+
+    validated = set()
+    for name in collection_names:
+        if name == 'knowledge-bases':
+            # System meta-collection — never exposed to non-admins.
+            continue
+        elif name.startswith('file-'):
+            file_id = name[len('file-') :]
+            if await has_access_to_file(file_id=file_id, access_type=access_type, user=user):
+                validated.add(name)
+        elif name.startswith('user-memory-'):
+            if name == f'user-memory-{user.id}':
+                validated.add(name)
+        elif name.startswith('web-search-'):
+            # Ephemeral collections created by process_web_search — safe
+            # to allow because they contain only transient web-search
+            # results scoped to the requesting user's session.
+            validated.add(name)
+        else:
+            # May be a knowledge-base ID or a legacy/ephemeral collection.
+            # If it IS a KB, enforce access control.  If no such KB
+            # exists, treat it as a non-sensitive collection (e.g. legacy
+            # model knowledge, process_text SHA256 collections) and allow.
+            if await Knowledges.check_access_by_user_id(name, user.id, permission=access_type):
+                validated.add(name)
+            elif not await Knowledges.get_knowledge_by_id(name):
+                # Not a KB at all — legacy/ephemeral collection, allow
+                validated.add(name)
+    return validated
 
 
 async def get_sources_from_items(
@@ -966,12 +1164,12 @@ async def get_sources_from_items(
 
         elif item.get('type') == 'note':
             # Note Attached
-            note = Notes.get_note_by_id(item.get('id'))
+            note = await Notes.get_note_by_id(item.get('id'))
 
             if note and (
                 user.role == 'admin'
                 or note.user_id == user.id
-                or AccessGrants.has_access(
+                or await AccessGrants.has_access(
                     user_id=user.id,
                     resource_type='note',
                     resource_id=note.id,
@@ -986,7 +1184,7 @@ async def get_sources_from_items(
 
         elif item.get('type') == 'chat':
             # Chat Attached
-            chat = Chats.get_chat_by_id(item.get('id'))
+            chat = await Chats.get_chat_by_id(item.get('id'))
 
             if chat and (user.role == 'admin' or chat.user_id == user.id):
                 messages_map = chat.chat.get('history', {}).get('messages', {})
@@ -1030,8 +1228,12 @@ async def get_sources_from_items(
                         ],
                     }
                 elif item.get('id'):
-                    file_object = Files.get_file_by_id(item.get('id'))
-                    if file_object:
+                    file_object = await Files.get_file_by_id(item.get('id'))
+                    if file_object and (
+                        user.role == 'admin'
+                        or file_object.user_id == user.id
+                        or await has_access_to_file(item.get('id'), 'read', user)
+                    ):
                         query_result = {
                             'documents': [[file_object.data.get('content', '')]],
                             'metadatas': [
@@ -1053,12 +1255,12 @@ async def get_sources_from_items(
 
         elif item.get('type') == 'collection':
             # Manual Full Mode Toggle for Collection
-            knowledge_base = Knowledges.get_knowledge_by_id(item.get('id'))
+            knowledge_base = await Knowledges.get_knowledge_by_id(item.get('id'))
 
             if knowledge_base and (
                 user.role == 'admin'
                 or knowledge_base.user_id == user.id
-                or AccessGrants.has_access(
+                or await AccessGrants.has_access(
                     user_id=user.id,
                     resource_type='knowledge',
                     resource_id=knowledge_base.id,
@@ -1069,14 +1271,14 @@ async def get_sources_from_items(
                     if knowledge_base and (
                         user.role == 'admin'
                         or knowledge_base.user_id == user.id
-                        or AccessGrants.has_access(
+                        or await AccessGrants.has_access(
                             user_id=user.id,
                             resource_type='knowledge',
                             resource_id=knowledge_base.id,
                             permission='read',
                         )
                     ):
-                        files = Knowledges.get_files_by_id(knowledge_base.id)
+                        files = await Knowledges.get_files_by_id(knowledge_base.id)
 
                         documents = []
                         metadatas = []
@@ -1122,35 +1324,26 @@ async def get_sources_from_items(
                 log.debug(f'skipping {item} as it has already been extracted')
                 continue
 
+            # Filter out collections the user cannot read
+            if user:
+                collection_names = await filter_accessible_collections(collection_names, user)
+                if not collection_names:
+                    log.debug(f'access denied for all collections in item {item}')
+                    continue
+
             try:
                 if full_context:
-                    query_result = get_all_items_from_collections(collection_names)
+                    # Sync helper makes blocking VECTOR_DB_CLIENT calls;
+                    # offload so the async caller's event loop stays free.
+                    query_result = await asyncio.to_thread(get_all_items_from_collections, collection_names)
                 else:
-                    query_result = None  # Initialize to None
-                    if hybrid_search:
-                        try:
-                            query_result = await query_collection_with_hybrid_search(
-                                collection_names=collection_names,
-                                queries=queries,
-                                embedding_function=embedding_function,
-                                k=k,
-                                reranking_function=reranking_function,
-                                k_reranker=k_reranker,
-                                r=r,
-                                hybrid_bm25_weight=hybrid_bm25_weight,
-                                enable_enriched_texts=request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS,
-                            )
-                        except Exception as e:
-                            log.debug('Error when using hybrid search, using non hybrid search as fallback.')
-
-                    # fallback to non-hybrid search
-                    if not hybrid_search and query_result is None:
-                        query_result = await query_collection(
-                            collection_names=collection_names,
-                            queries=queries,
-                            embedding_function=embedding_function,
-                            k=k,
-                        )
+                    query_result = await query_collection(
+                        request,
+                        collection_names=collection_names,
+                        queries=queries,
+                        embedding_function=embedding_function,
+                        k=k,
+                    )
             except Exception as e:
                 log.exception(e)
 

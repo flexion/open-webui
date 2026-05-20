@@ -21,8 +21,10 @@
 	import { goto } from '$app/navigation';
 
 	import ShareChatModal from '../chat/ShareChatModal.svelte';
+	import ModelHelperModal from '../chat/ModelHelperModal.svelte';
 	import ModelSelector from '../chat/ModelSelector.svelte';
 	import Tooltip from '../common/Tooltip.svelte';
+	import Sparkles from '../icons/Sparkles.svelte';
 	import Menu from '$lib/components/layout/Navbar/Menu.svelte';
 	import UserMenu from '$lib/components/layout/Sidebar/UserMenu.svelte';
 	import AdjustmentsHorizontal from '../icons/AdjustmentsHorizontal.svelte';
@@ -45,6 +47,7 @@
 	export let initNewChat: Function;
 	export let shareEnabled: boolean = false;
 	export let scrollTop = 0;
+	export let scrollToTop: (() => void) | null = null;
 
 	export let chat;
 	export let history;
@@ -53,15 +56,18 @@
 
 	export let onSaveTempChat: () => {};
 	export let archiveChatHandler: (id: string) => void;
+	export let deleteChatHandler: (id: string) => void;
 	export let moveChatHandler: (id: string, folderId: string) => void;
 
 	let closedBannerIds = [];
 
 	let showShareChatModal = false;
 	let showDownloadChatModal = false;
+	let showModelHelperModal = false;
 </script>
 
 <ShareChatModal bind:show={showShareChatModal} chatId={$chatId} />
+<ModelHelperModal bind:show={showModelHelperModal} bind:selectedModels />
 
 <button
 	id="new-chat-button"
@@ -107,12 +113,25 @@
 				{/if}
 
 				<div
-					class="flex-1 overflow-hidden max-w-full mt-0.5 py-0.5
+					class="flex items-center flex-1 overflow-hidden max-w-full mt-0.5 py-0.5
 			{$showSidebar ? 'ml-1' : ''}
 			"
 				>
 					{#if showModelSelector}
-						<ModelSelector bind:selectedModels showSetDefault={!shareEnabled} />
+						<Tooltip content={$i18n.t('Model Helper')}>
+							<button
+								class="flex cursor-pointer p-1.5 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-850 transition text-gray-500 dark:text-gray-400 mr-1"
+								on:click={() => {
+									showModelHelperModal = true;
+								}}
+								aria-label="Model Helper"
+							>
+								<Sparkles className="size-4" strokeWidth="2" />
+							</button>
+						</Tooltip>
+						<div class="flex-1 overflow-hidden">
+							<ModelSelector bind:selectedModels showSetDefault={!shareEnabled} />
+						</div>
 					{/if}
 				</div>
 
@@ -193,11 +212,15 @@
 						<Menu
 							{chat}
 							{shareEnabled}
+							{scrollToTop}
 							shareHandler={() => {
 								showShareChatModal = !showShareChatModal;
 							}}
 							archiveChatHandler={() => {
 								archiveChatHandler(chat.id);
+							}}
+							deleteChatHandler={() => {
+								deleteChatHandler(chat.id);
 							}}
 							{moveChatHandler}
 						>

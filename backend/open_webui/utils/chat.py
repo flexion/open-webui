@@ -10,7 +10,7 @@ import json
 import uuid
 import asyncio
 
-from fastapi import Request, status
+from fastapi import HTTPException, Request, status
 from starlette.responses import Response, StreamingResponse, JSONResponse
 
 
@@ -56,6 +56,8 @@ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 
 
+# When the question has been asked, let silence not be the
+# answer. But if the answer must wait, let it come honest.
 async def generate_direct_chat_completion(
     request: Request,
     form_data: dict,
@@ -70,7 +72,12 @@ async def generate_direct_chat_completion(
     session_id = metadata.get('session_id')
     request_id = str(uuid.uuid4())  # Generate a unique request ID
 
-    event_caller = get_event_call(metadata)
+    event_caller = await get_event_call(metadata)
+    if event_caller is None:
+        raise Exception(
+            'Direct connection requires an active WebSocket session; '
+            'cannot generate completion in this context (e.g. background task).'
+        )
 
     channel = f'{user_id}:{session_id}:{request_id}'
     logging.info(f'WebSocket channel: {channel}')
@@ -178,10 +185,14 @@ async def generate_chat_completion(
             }
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
+        # Merge the direct connection model into server models so that
+        # task functions (title, tags, etc.) can resolve a server-side
+        # task model while still having the direct model available.
         models = {
+            **request.app.state.MODELS,
             request.state.model['id']: request.state.model,
         }
-        log.debug(f'direct connection to model: {models}')
+        log.debug(f'direct connection to model: {request.state.model["id"]}')
     else:
         models = request.app.state.MODELS
 
@@ -191,37 +202,51 @@ async def generate_chat_completion(
 
     model = models[model_id]
 
-    if getattr(request.state, 'direct', False):
+    if getattr(request.state, 'direct', False) and model_id == getattr(request.state, 'model', {}).get('id'):
         return await generate_direct_chat_completion(request, form_data, user=user, models=models)
     else:
         # Check if user has access to the model
         if not bypass_filter and user.role == 'user':
             try:
-                check_model_access(user, model)
+                await check_model_access(user, model)
             except Exception as e:
                 raise e
 
-        if model.get('owned_by') == 'arena':
+        # Arena model — sub-model was already resolved by process_chat_payload.
+        # Inject selected_model_id into the response for the frontend.
+        metadata = form_data.get('metadata', {})
+        selected_model_id = metadata.pop('selected_model_id', None)
+        # Also clear from request.state.metadata to prevent the merge at
+        # lines 177-179 from re-adding it on the recursive call.
+        if hasattr(request.state, 'metadata'):
+            request.state.metadata.pop('selected_model_id', None)
+
+        # Fallback: if generate_chat_completion is called with an arena model
+        # from a path that did NOT go through process_chat_payload (e.g.,
+        # background tasks for title/follow-up/tags generation), resolve now.
+        if not selected_model_id and model.get('owned_by') == 'arena':
             model_ids = model.get('info', {}).get('meta', {}).get('model_ids')
             filter_mode = model.get('info', {}).get('meta', {}).get('filter_mode')
             if model_ids and filter_mode == 'exclude':
                 model_ids = [
-                    model['id']
-                    for model in list(request.app.state.MODELS.values())
-                    if model.get('owned_by') != 'arena' and model['id'] not in model_ids
+                    available_model['id']
+                    for available_model in list(request.app.state.MODELS.values())
+                    if available_model.get('owned_by') != 'arena' and available_model['id'] not in model_ids
                 ]
 
-            selected_model_id = None
             if isinstance(model_ids, list) and model_ids:
                 selected_model_id = random.choice(model_ids)
             else:
                 model_ids = [
-                    model['id'] for model in list(request.app.state.MODELS.values()) if model.get('owned_by') != 'arena'
+                    available_model['id']
+                    for available_model in list(request.app.state.MODELS.values())
+                    if available_model.get('owned_by') != 'arena'
                 ]
                 selected_model_id = random.choice(model_ids)
 
             form_data['model'] = selected_model_id
 
+        if selected_model_id:
             if form_data.get('stream') == True:
 
                 async def stream_wrapper(stream):
@@ -294,12 +319,17 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
+            **request.app.state.MODELS,
             request.state.model['id']: request.state.model,
         }
     else:
         models = request.app.state.MODELS
 
     data = form_data
+
+    if not data.get('id'):
+        raise Exception('Missing message id')
+
     model_id = data['model']
     if model_id not in models:
         raise Exception('Model not found')
@@ -308,8 +338,13 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
 
     try:
         data = await process_pipeline_outlet_filter(request, data, user, models)
+    except HTTPException:
+        raise
     except Exception as e:
         raise Exception(f'Error: {e}')
+
+    if not data.get('id'):
+        raise Exception('Missing message id')
 
     metadata = {
         'chat_id': data['chat_id'],
@@ -320,8 +355,8 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
     }
 
     extra_params = {
-        '__event_emitter__': get_event_emitter(metadata),
-        '__event_call__': get_event_call(metadata),
+        '__event_emitter__': await get_event_emitter(metadata),
+        '__event_call__': await get_event_call(metadata),
         '__user__': user.model_dump() if isinstance(user, UserModel) else {},
         '__metadata__': metadata,
         '__request__': request,
@@ -329,8 +364,8 @@ async def chat_completed(request: Request, form_data: dict, user: Any):
     }
 
     try:
-        filter_ids = get_sorted_filter_ids(request, model, metadata.get('filter_ids', []))
-        filter_functions = Functions.get_functions_by_ids(filter_ids)
+        filter_ids = await get_sorted_filter_ids(request, model, metadata.get('filter_ids', []))
+        filter_functions = await Functions.get_functions_by_ids(filter_ids)
 
         result, _ = await process_filter_functions(
             request=request,

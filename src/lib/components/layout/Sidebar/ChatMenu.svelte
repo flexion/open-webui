@@ -112,8 +112,13 @@
 					clonedElement.style.height = 'auto';
 					document.body.appendChild(clonedElement);
 
-					// Wait for DOM update/layout
-					await new Promise((r) => setTimeout(r, 100));
+					// Override content-visibility so html2canvas can capture all messages
+					clonedElement.querySelectorAll('.message-listitem').forEach((el) => {
+						el.style.contentVisibility = 'visible';
+					});
+
+					// Let the browser compute layout for the cloned element
+					await new Promise((r) => requestAnimationFrame(r));
 
 					// Render entire content once
 					const canvas = await html2canvas(clonedElement, {
@@ -308,7 +313,9 @@
 				</button>
 			{/if}
 
-			<DropdownSub contentClass="select-none rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg border border-gray-100 dark:border-gray-800">
+			<DropdownSub
+				contentClass="select-none rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white shadow-lg border border-gray-100 dark:border-gray-800"
+			>
 				<button
 					slot="trigger"
 					draggable="false"
@@ -384,6 +391,7 @@
 				draggable="false"
 				class="flex gap-2 items-center px-3 py-1.5 text-sm cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-xl w-full"
 				on:click={() => {
+					show = false;
 					cloneChatHandler();
 				}}
 			>
@@ -392,7 +400,9 @@
 			</button>
 
 			{#if chatId && $folders.length > 0}
-				<DropdownSub contentClass="select-none rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white border border-gray-100 dark:border-gray-800 shadow-lg max-h-52 overflow-y-auto scrollbar-hidden">
+				<DropdownSub
+					contentClass="select-none rounded-2xl p-1 z-50 bg-white dark:bg-gray-850 dark:text-white border border-gray-100 dark:border-gray-800 shadow-lg max-h-52 overflow-y-auto scrollbar-hidden"
+				>
 					<button
 						slot="trigger"
 						draggable="false"

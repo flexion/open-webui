@@ -6,9 +6,10 @@ import aiohttp
 
 from typing import Optional
 
-from open_webui.env import AIOHTTP_CLIENT_TIMEOUT
+from open_webui.env import AIOHTTP_CLIENT_SESSION_SSL, AIOHTTP_CLIENT_TIMEOUT
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.config import get_config, save_config
+from open_webui.utils.headers import get_custom_headers
+from open_webui.config import get_config, save_config, async_save_config
 from open_webui.config import BannerModel
 
 from open_webui.utils.tools import (
@@ -24,8 +25,10 @@ from open_webui.models.oauth_sessions import OAuthSessions
 from open_webui.utils.oauth import (
     get_discovery_urls,
     get_oauth_client_info_with_dynamic_client_registration,
+    get_oauth_client_info_with_static_credentials,
     encrypt_data,
     decrypt_data,
+    resolve_oauth_client_info,
     OAuthClientInformationFull,
 )
 from mcp.shared.auth import OAuthMetadata
@@ -37,6 +40,8 @@ log = logging.getLogger(__name__)
 
 ############################
 # ImportConfig
+# Thy configuration come, thy settings be done,
+# in production as it is in development.
 ############################
 
 
@@ -45,8 +50,9 @@ class ImportConfigForm(BaseModel):
 
 
 @router.post('/import', response_model=dict)
-async def import_config(form_data: ImportConfigForm, user=Depends(get_admin_user)):
-    save_config(form_data.config)
+async def import_config(request: Request, form_data: ImportConfigForm, user=Depends(get_admin_user)):
+    await async_save_config(form_data.config)
+    request.app.state.config._sync_to_redis()
     return get_config()
 
 
@@ -97,6 +103,8 @@ class OAuthClientRegistrationForm(BaseModel):
     url: str
     client_id: str
     client_name: Optional[str] = None
+    client_secret: Optional[str] = None
+    oauth_server_url: Optional[str] = None
 
 
 @router.post('/oauth/clients/register')
@@ -111,9 +119,21 @@ async def register_oauth_client(
         if type:
             oauth_client_id = f'{type}:{form_data.client_id}'
 
-        oauth_client_info = await get_oauth_client_info_with_dynamic_client_registration(
-            request, oauth_client_id, form_data.url
-        )
+        oauth_server_url = form_data.oauth_server_url if form_data.oauth_server_url else form_data.url
+
+        if form_data.client_secret:
+            # Static credentials: skip dynamic registration, build from provided credentials
+            oauth_client_info = await get_oauth_client_info_with_static_credentials(
+                request,
+                oauth_client_id,
+                oauth_server_url,
+                oauth_client_id=form_data.client_id,
+                oauth_client_secret=form_data.client_secret,
+            )
+        else:
+            oauth_client_info = await get_oauth_client_info_with_dynamic_client_registration(
+                request, oauth_client_id, oauth_server_url
+            )
         return {
             'status': True,
             'oauth_client_info': encrypt_data(oauth_client_info.model_dump(mode='json')),
@@ -139,6 +159,7 @@ class ToolServerConnection(BaseModel):
     headers: Optional[dict | str] = None
     key: Optional[str]
     config: Optional[dict]
+    info: Optional[dict] = None
 
     model_config = ConfigDict(extra='allow')
 
@@ -164,7 +185,7 @@ async def set_tool_servers_config(
         server_type = connection.get('type', 'openapi')
         auth_type = connection.get('auth_type', 'none')
 
-        if auth_type == 'oauth_2.1':
+        if auth_type in ('oauth_2.1', 'oauth_2.1_static'):
             # Remove existing OAuth clients for tool servers
             server_id = connection.get('info', {}).get('id')
             client_key = f'{server_type}:{server_id}'
@@ -187,11 +208,9 @@ async def set_tool_servers_config(
             server_id = connection.get('info', {}).get('id')
             auth_type = connection.get('auth_type', 'none')
 
-            if auth_type == 'oauth_2.1' and server_id:
+            if auth_type in ('oauth_2.1', 'oauth_2.1_static') and server_id:
                 try:
-                    oauth_client_info = connection.get('info', {}).get('oauth_client_info', '')
-                    oauth_client_info = decrypt_data(oauth_client_info)
-
+                    oauth_client_info = resolve_oauth_client_info(connection)
                     request.app.state.oauth_client_manager.add_client(
                         f'{server_type}:{server_id}',
                         OAuthClientInformationFull(**oauth_client_info),
@@ -255,6 +274,98 @@ async def set_terminal_servers_config(
     }
 
 
+@router.post('/terminal_servers/verify')
+async def verify_terminal_server_connection(
+    request: Request, form_data: TerminalServerConnection, user=Depends(get_admin_user)
+):
+    """
+    Verify the connection to a terminal server by detecting its type.
+
+    Tries GET {url}/api/v1/policies (orchestrator) then GET {url}/api/config
+    (plain terminal).  Returns ``{status: true, type: "orchestrator"|"terminal"}``.
+    """
+    base_url = (form_data.url or '').rstrip('/')
+    if not base_url:
+        raise HTTPException(status_code=400, detail='Terminal server URL is required')
+
+    headers = {}
+    if form_data.auth_type == 'bearer' and form_data.key:
+        headers['Authorization'] = f'Bearer {form_data.key}'
+
+    try:
+        async with aiohttp.ClientSession(
+            trust_env=True,
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+        ) as session:
+            # Orchestrators expose a policies API; plain terminals don't.
+            try:
+                async with session.get(
+                    f'{base_url}/api/v1/policies', headers=headers, ssl=AIOHTTP_CLIENT_SESSION_SSL
+                ) as resp:
+                    if resp.ok:
+                        return {'status': True, 'type': 'orchestrator'}
+            except Exception:
+                pass
+
+            # Fall back to open-terminal config endpoint.
+            try:
+                async with session.get(
+                    f'{base_url}/api/config', headers=headers, ssl=AIOHTTP_CLIENT_SESSION_SSL
+                ) as resp:
+                    if resp.ok:
+                        return {'status': True, 'type': 'terminal'}
+            except Exception:
+                pass
+
+    except Exception as e:
+        log.debug(f'Failed to connect to the terminal server: {e}')
+
+    raise HTTPException(status_code=400, detail='Failed to connect to the terminal server')
+
+
+class TerminalServerPolicyForm(BaseModel):
+    url: str
+    key: Optional[str] = ''
+    auth_type: Optional[str] = 'bearer'
+    policy_id: str
+    policy_data: dict
+
+
+@router.post('/terminal_servers/policy')
+async def put_terminal_server_policy(
+    request: Request, form_data: TerminalServerPolicyForm, user=Depends(get_admin_user)
+):
+    """
+    Proxy a policy PUT to an orchestrator terminal server.
+    """
+    base_url = (form_data.url or '').rstrip('/')
+    if not base_url:
+        raise HTTPException(status_code=400, detail='Terminal server URL is required')
+
+    headers = {'Content-Type': 'application/json'}
+    if form_data.auth_type == 'bearer' and form_data.key:
+        headers['Authorization'] = f'Bearer {form_data.key}'
+
+    try:
+        async with aiohttp.ClientSession(
+            trust_env=True,
+            timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
+        ) as session:
+            policy_url = f'{base_url}/api/v1/policies/{form_data.policy_id}'
+            async with session.put(
+                policy_url, headers=headers, json=form_data.policy_data, ssl=AIOHTTP_CLIENT_SESSION_SSL
+            ) as resp:
+                if resp.ok:
+                    return await resp.json()
+                detail = await resp.text()
+                raise HTTPException(status_code=resp.status, detail=detail)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.debug(f'Failed to save policy to terminal server: {e}')
+        raise HTTPException(status_code=400, detail='Failed to save policy to terminal server')
+
+
 @router.post('/tool_servers/verify')
 async def verify_tool_servers_config(request: Request, form_data: ToolServerConnection, user=Depends(get_admin_user)):
     """
@@ -262,15 +373,22 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
     """
     try:
         if form_data.type == 'mcp':
-            if form_data.auth_type == 'oauth_2.1':
-                discovery_urls = await get_discovery_urls(form_data.url)
+            if form_data.auth_type in ('oauth_2.1', 'oauth_2.1_static'):
+                oauth_server_url = (
+                    form_data.info.get('oauth_server_url')
+                    if form_data.info and form_data.info.get('oauth_server_url')
+                    else form_data.url
+                )
+                discovery_urls = await get_discovery_urls(oauth_server_url)
                 for discovery_url in discovery_urls:
                     log.debug(f'Trying to fetch OAuth 2.1 discovery document from {discovery_url}')
                     async with aiohttp.ClientSession(
                         trust_env=True,
                         timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT),
                     ) as session:
-                        async with session.get(discovery_url) as oauth_server_metadata_response:
+                        async with session.get(
+                            discovery_url, ssl=AIOHTTP_CLIENT_SESSION_SSL
+                        ) as oauth_server_metadata_response:
                             if oauth_server_metadata_response.status == 200:
                                 try:
                                     oauth_server_metadata = OAuthMetadata.model_validate(
@@ -320,7 +438,8 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
                     if form_data.headers and isinstance(form_data.headers, dict):
                         if headers is None:
                             headers = {}
-                        headers.update(form_data.headers)
+                        custom_headers = get_custom_headers(form_data.headers, user)
+                        headers.update(custom_headers)
 
                     await client.connect(form_data.url, headers=headers)
                     specs = await client.list_tool_specs()
@@ -364,7 +483,8 @@ async def verify_tool_servers_config(request: Request, form_data: ToolServerConn
             if form_data.headers and isinstance(form_data.headers, dict):
                 if headers is None:
                     headers = {}
-                headers.update(form_data.headers)
+                custom_headers = get_custom_headers(form_data.headers, user)
+                headers.update(custom_headers)
 
             url = get_tool_server_url(form_data.url, form_data.path)
             return await get_tool_server_data(url, headers=headers)
@@ -473,6 +593,13 @@ class ModelsConfigForm(BaseModel):
     MODEL_ORDER_LIST: Optional[list[str]]
     DEFAULT_MODEL_METADATA: Optional[dict] = None
     DEFAULT_MODEL_PARAMS: Optional[dict] = None
+
+
+@router.get('/models/defaults')
+async def get_models_defaults(request: Request, user=Depends(get_verified_user)):
+    return {
+        'DEFAULT_MODEL_METADATA': request.app.state.config.DEFAULT_MODEL_METADATA,
+    }
 
 
 @router.get('/models', response_model=ModelsConfigForm)
