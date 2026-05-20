@@ -1165,10 +1165,15 @@ OPENAI_API_BASE_URLS = [
 ]
 OPENAI_API_BASE_URLS = PersistentConfig('OPENAI_API_BASE_URLS', 'openai.api_base_urls', OPENAI_API_BASE_URLS)
 
+try:
+    _openai_api_configs_env = json.loads(os.environ.get('OPENAI_API_CONFIGS', '{}'))
+except Exception:
+    _openai_api_configs_env = {}
+
 OPENAI_API_CONFIGS = PersistentConfig(
     'OPENAI_API_CONFIGS',
     'openai.api_configs',
-    {},
+    _openai_api_configs_env,
 )
 
 # Get the actual OpenAI API key based on the base URL
