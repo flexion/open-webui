@@ -41,7 +41,10 @@ jobs:
           git config user.name 'flex-upstream-sync-bot'
           git config user.email 'flex-upstream-sync-bot@users.noreply.github.com'
           git remote add upstream https://github.com/open-webui/open-webui.git
-          git fetch upstream --tags --prune
+          # --force: this fork's tag history diverges from upstream for some
+          # legacy tags (e.g. v0.6.40 points to a different commit). We always
+          # want upstream's tag values when resolving the sync target.
+          git fetch upstream --tags --prune --force
 
       - name: Resolve target tag
         id: target
