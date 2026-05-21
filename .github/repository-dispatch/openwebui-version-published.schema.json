@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flexion.us/schemas/openwebui-version-published.json",
+  "title": "openwebui-version-published",
+  "description": "Cross-repo dispatch payload sent from flexion/open-webui's publish-flex-image.yml to flexion/flexion-open-webui-infra's open-version-bump-pr.yml after a successful ECR push. The single inter-repo data wire defined in the auto-upgrade pipeline phase 1 design doc.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "digest", "environment", "upstream_changelog_url"],
+  "properties": {
+    "version": {
+      "description": "Upstream open-webui release tag, verbatim (keep the leading v).",
+      "type": "string",
+      "pattern": "^v\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
+    },
+    "digest": {
+      "description": "ECR imageDigest captured at push (sha256 hex).",
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "environment": {
+      "description": "Target environment. Phase 1 only ever fires for dev; the receiver refuses anything else.",
+      "type": "string",
+      "enum": ["dev"]
+    },
+    "upstream_changelog_url": {
+      "description": "Operator-readable link to the upstream release page.",
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://github\\.com/open-webui/open-webui/releases/tag/v\\d+\\.\\d+\\.\\d+(?:-[0-9A-Za-z.-]+)?$"
+    }
+  }
+}

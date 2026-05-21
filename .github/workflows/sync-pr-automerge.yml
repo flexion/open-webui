@@ -1,0 +1,123 @@
+# Stage 2 of the auto-upgrade pipeline.
+#
+# Auto-merges sync PRs opened by upstream-sync.yml when there are no
+# shared-source conflicts (manual_count: 0). On merge, stage 3
+# (publish-flex-image.yml) takes over via its push trigger.
+
+name: Sync PR auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+concurrency:
+  group: sync-pr-automerge-${{ github.event.pull_request.number || github.event.check_suite.id }}
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    if: |
+      github.event_name == 'check_suite' ||
+      (github.event_name == 'pull_request_target' && startsWith(github.head_ref, 'upstream-sync/'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve candidate PR(s)
+        id: prs
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
+            echo "numbers=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HEAD_SHA="${{ github.event.check_suite.head_sha }}"
+          NUMS=$(gh pr list --state open --search "in:title chore: upstream-sync" \
+            --json number,headRefOid,headRefName \
+            --jq "[.[] | select(.headRefOid == \"$HEAD_SHA\" and (.headRefName | startswith(\"upstream-sync/\"))) | .number] | join(\",\")")
+          echo "numbers=${NUMS}" >> "$GITHUB_OUTPUT"
+
+      - name: Evaluate and merge
+        if: steps.prs.outputs.numbers != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+          BOT_LOGIN: flex-upstream-sync-bot
+          NUMS: ${{ steps.prs.outputs.numbers }}
+        run: |
+          set -e
+          # 15-minute grace window — gives late-arriving check suites time to
+          # land before we merge. Without this, merging on the first green
+          # check could race a slow lint job.
+          GRACE_SECONDS=900
+
+          IFS=',' read -ra ARR <<< "$NUMS"
+          for NUM in "${ARR[@]}"; do
+            [ -z "$NUM" ] && continue
+            echo "::group::Evaluating PR #$NUM"
+            DATA=$(gh pr view "$NUM" --json author,title,body,headRefName,isDraft,mergeable,mergeStateStatus,createdAt)
+            AUTHOR=$(echo "$DATA" | jq -r '.author.login')
+            TITLE=$(echo "$DATA" | jq -r '.title')
+            BODY=$(echo "$DATA" | jq -r '.body')
+            HEAD=$(echo "$DATA" | jq -r '.headRefName')
+            DRAFT=$(echo "$DATA" | jq -r '.isDraft')
+            MERGEABLE=$(echo "$DATA" | jq -r '.mergeable')
+            STATE=$(echo "$DATA" | jq -r '.mergeStateStatus')
+            CREATED=$(echo "$DATA" | jq -r '.createdAt')
+
+            if [ "$AUTHOR" != "$BOT_LOGIN" ] && [ "$AUTHOR" != "app/${BOT_LOGIN}" ]; then
+              echo "::notice::author $AUTHOR is not the bot — skipping"
+              echo "::endgroup::"; continue
+            fi
+            case "$HEAD" in
+              upstream-sync/*) : ;;
+              *)
+                echo "::notice::head $HEAD does not match upstream-sync/* — skipping"
+                echo "::endgroup::"; continue ;;
+            esac
+            if [ "$DRAFT" = "true" ]; then
+              echo "::notice::draft — skipping (manual conflicts present)"
+              echo "::endgroup::"; continue
+            fi
+
+            # The rebase step writes "Files needing manual review (N)" into
+            # the PR body. We only auto-merge when N == 0. The body of a
+            # clean rebase contains "## Clean rebase".
+            if ! echo "$BODY" | grep -q "## Clean rebase"; then
+              echo "::notice::PR body does not show a clean rebase — skipping"
+              echo "::endgroup::"; continue
+            fi
+
+            if [ "$MERGEABLE" != "MERGEABLE" ] || [ "$STATE" != "CLEAN" ]; then
+              echo "::notice::not yet mergeable (mergeable=$MERGEABLE state=$STATE)"
+              echo "::endgroup::"; continue
+            fi
+
+            CREATED_TS=$(date -d "$CREATED" +%s)
+            NOW_TS=$(date -u +%s)
+            AGE=$((NOW_TS - CREATED_TS))
+            if [ "$AGE" -lt "$GRACE_SECONDS" ]; then
+              echo "::notice::PR age ${AGE}s < grace ${GRACE_SECONDS}s — waiting for late checks"
+              echo "::endgroup::"; continue
+            fi
+
+            # Squash-merge with an Upstream-Tag trailer so stage 3 (publish)
+            # can extract the target tag from the merged commit message.
+            TAG=$(echo "$TITLE" | sed -E 's/.*onto (v[0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Could not extract upstream tag from title: $TITLE"
+              echo "::endgroup::"; continue
+            fi
+            COMMIT_MSG=$(printf 'chore: upstream-sync flex onto %s\n\nUpstream-Tag: %s\n' "$TAG" "$TAG")
+
+            echo "PR #$NUM eligible — squash-merging with Upstream-Tag: $TAG"
+            gh pr merge "$NUM" --squash --delete-branch \
+              --subject "chore: upstream-sync flex onto ${TAG} (#${NUM})" \
+              --body "Upstream-Tag: ${TAG}"
+            echo "::endgroup::"
+          done
