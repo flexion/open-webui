@@ -17,6 +17,11 @@ on:
         type: boolean
         default: false
 
+# NOTE: there is no `workflows` permission for GITHUB_TOKEN — it is not a valid
+# key here. GITHUB_TOKEN can therefore never push commits that add or modify
+# files under .github/workflows/, which `flex` legitimately carries. That push
+# needs a PAT / App token with the `workflow` scope, supplied as the
+# UPSTREAM_SYNC_TOKEN secret. See the preflight step below.
 permissions:
   contents: write
   pull-requests: write
@@ -28,13 +33,18 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      # Prefer a `workflow`-scoped PAT; fall back to GITHUB_TOKEN so runs that
+      # do not touch .github/workflows/ still work without extra setup.
+      SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+      HAVE_WORKFLOW_SCOPE: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
     steps:
       - name: Checkout flex with full history and tags
         uses: actions/checkout@v6
         with:
           ref: flex
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ env.SYNC_TOKEN }}
 
       - name: Configure git and fetch upstream tags
         run: |
@@ -92,17 +102,63 @@ jobs:
             exit 0
           fi
 
-          # If BASE is set, verify TARGET is actually newer (not older — guard
-          # against operator-supplied target_tag pointing to a past release).
+          # Guard against syncing backward (e.g. an operator-supplied target_tag
+          # pointing at a past release).
+          #
+          # Do NOT use `git merge-base --is-ancestor` here. Upstream does not
+          # keep linear tag ancestry: consecutive releases are frequently
+          # siblings rather than ancestor/descendant. For example upstream
+          # v0.9.5 (3660bc00) and v0.9.6 (1a97751e) diverge at a shared parent
+          # (41b48b54), so an ancestry test reports "not a descendant" for a
+          # perfectly valid forward sync. That mistake failed this workflow on
+          # 28 consecutive scheduled runs (2026-06-02 .. 2026-06-29).
+          #
+          # Compare release *versions* instead. The zero-padded numeric key
+          # orders correctly across component rollovers (v0.9.9 < v0.10.0),
+          # which a lexical comparison would get wrong.
           if [ -n "${BASE}" ] && [ "${FORCE}" != "true" ]; then
-            if ! git merge-base --is-ancestor "${BASE}" "${TARGET}"; then
-              echo "::error::Target ${TARGET} is not a descendant of current base ${BASE}. Refusing to sync backward. Pass force=true to override."
+            ver_key() { printf '%s' "${1#v}" | awk -F. '{printf "%d%03d%03d", $1, $2, $3}'; }
+            KEY_BASE=$(ver_key "${BASE}")
+            KEY_TARGET=$(ver_key "${TARGET}")
+            if [ "${KEY_TARGET}" -lt "${KEY_BASE}" ]; then
+              echo "::error::Target ${TARGET} is older than current base ${BASE}. Refusing to sync backward. Pass force=true to override."
               exit 1
             fi
           fi
 
           echo "Will sync flex from ${BASE:-<none>} → ${TARGET}"
           echo "sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight — token must be able to push workflow files
+        if: steps.decide.outputs.sync == 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          # `flex` diverges from upstream under .github/workflows/ (it adds
+          # publish-flex-image.yml and upstream-sync.yml, and disables several
+          # upstream ones). Replaying those commits means the push modifies
+          # workflow files, which GITHUB_TOKEN is forbidden from doing:
+          #   ! [remote rejected] refusing to allow a GitHub App to create or update
+          #     workflow `.github/workflows/backend.yaml` without `workflows` permission
+          # That failed 21 consecutive scheduled runs (2026-06-30 .. 2026-07-20).
+          # Detect it here rather than after a multi-minute rebase.
+          #
+          # Only *.yml / *.yaml are counted: GitHub does not parse *.disabled as
+          # workflows, so those do not trip the restriction and must not gate.
+          LIVE=$(git diff --name-only "${TARGET}...flex" -- \
+                   '.github/workflows/*.yml' '.github/workflows/*.yaml')
+          CHANGED=$(printf '%s' "${LIVE}" | grep -c . || true)
+          echo "live workflow files differing between ${TARGET} and flex: ${CHANGED}"
+
+          if [ "${CHANGED}" -gt 0 ] && [ "${HAVE_WORKFLOW_SCOPE}" != "true" ]; then
+            printf '%s\n' "${LIVE}" | sed 's/^/  - /'
+            echo "::error title=Missing UPSTREAM_SYNC_TOKEN::This sync must push ${CHANGED} workflow file(s), which GITHUB_TOKEN cannot do (there is no 'workflows' permission for it). Create a PAT or GitHub App token with the 'workflow' scope and add it as the repository secret UPSTREAM_SYNC_TOKEN, then re-run."
+            exit 1
+          fi
+
+          if [ "${CHANGED}" -gt 0 ]; then
+            echo "::notice::Using UPSTREAM_SYNC_TOKEN for the workflow-file push (${CHANGED} file(s))."
+          fi
 
       - name: Create throwaway branch
         if: steps.decide.outputs.sync == 'true'
@@ -192,7 +248,13 @@ jobs:
       - name: Push throwaway branch and open PR
         if: steps.decide.outputs.sync == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ env.SYNC_TOKEN }}
+          # This repo is a fork of open-webui/open-webui, and the step above
+          # adds an `upstream` remote pointing at that parent. Without GH_REPO,
+          # `gh` resolves the base repo to the PARENT and createPullRequest
+          # fails with "Resource not accessible by integration", because the
+          # token is only valid for this fork. Pin gh to this repository.
+          GH_REPO: ${{ github.repository }}
           BRANCH: ${{ steps.branch.outputs.branch }}
           MANUAL_COUNT: ${{ steps.rebase.outputs.manual_count }}
           TARGET: ${{ steps.target.outputs.target }}
