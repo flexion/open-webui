@@ -2,6 +2,7 @@ import asyncio
 import base64
 import fnmatch
 import hashlib
+import json
 import logging
 import re
 import sys
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta
 from functools import partialmethod
 from types import SimpleNamespace
 from typing import Literal, Optional
+from urllib.parse import quote
 
 import aiohttp
 import jwt
@@ -38,6 +40,7 @@ from open_webui.config import (
     ENABLE_OAUTH_GROUP_MANAGEMENT,
     ENABLE_OAUTH_ROLE_MANAGEMENT,
     ENABLE_OAUTH_SIGNUP,
+    GOOGLE_OAUTH_SCOPE,
     JWT_EXPIRES_IN,
     OAUTH_ACCESS_TOKEN_REQUEST_INCLUDE_CLIENT_ID,
     OAUTH_ADMIN_ROLES,
@@ -1504,7 +1507,7 @@ class OAuthManager:
             log.error(f'Exception during token refresh for provider {provider}: {e}')
             return None
 
-    async def get_user_role(self, user, user_data):
+    async def get_user_role(self, user, user_data, provider=None, access_token=None):
         auth_config = await get_oauth_runtime_config()
         user_count = await Users.get_num_users()
         if user and user_count == 1:
@@ -1528,29 +1531,58 @@ class OAuthManager:
             # Keep existing users at their current role unless the provider sent roles.
             role = user.role if user else auth_config.DEFAULT_USER_ROLE
 
-            # Next block extracts the roles from the user data, accepting nested claims of any depth
-            if oauth_claim and oauth_allowed_roles and oauth_admin_roles:
-                claim_data = user_data
-                nested_claims = oauth_claim.split('.')
-                for nested_claim in nested_claims:
-                    claim_data = claim_data.get(nested_claim, {})
+            if (
+                    provider == "google"
+                    and access_token
+                    and "https://www.googleapis.com/auth/cloud-identity.groups.readonly"
+                    in GOOGLE_OAUTH_SCOPE
+            ):
+                log.debug(
+                    "Google OAuth with Cloud Identity scope detected - fetching groups via API"
+                )
+                user_email = user_data.get(auth_config.OAUTH_EMAIL_CLAIM, "")
+                if user_email:
+                    try:
+                        google_groups = (
+                            await self._fetch_google_groups_via_cloud_identity(
+                                access_token, user_email
+                            )
+                        )
+                        if "google_groups" not in user_data:
+                            user_data["google_groups"] = google_groups
 
-                # Try flat claim structure as alternative
-                if not claim_data:
-                    claim_data = user_data.get(oauth_claim, {})
+                        # Use Google groups as oauth_roles for role determination
+                        oauth_roles = google_groups
+                        log.debug(f"Using Google groups as roles: {oauth_roles}")
+                    except Exception as e:
+                        log.error(f"Failed to fetch Google groups: {e}")
+                        oauth_roles = []
 
-                oauth_roles = []
+            # If not using Google groups or Google groups fetch failed, use traditional claims method
+            if not oauth_roles:
+                # Next block extracts the roles from the user data, accepting nested claims of any depth
+                if oauth_claim and oauth_allowed_roles and oauth_admin_roles:
+                    claim_data = user_data
+                    nested_claims = oauth_claim.split(".")
+                    for nested_claim in nested_claims:
+                        claim_data = claim_data.get(nested_claim, {})
 
-                if isinstance(claim_data, list):
-                    oauth_roles = claim_data
-                elif isinstance(claim_data, str):
-                    # Split by the configured separator if present
-                    if OAUTH_ROLES_SEPARATOR and OAUTH_ROLES_SEPARATOR in claim_data:
-                        oauth_roles = claim_data.split(OAUTH_ROLES_SEPARATOR)
-                    else:
-                        oauth_roles = [claim_data]
-                elif isinstance(claim_data, int):
-                    oauth_roles = [str(claim_data)]
+                    # Try flat claim structure as alternative
+                    if not claim_data:
+                        claim_data = user_data.get(oauth_claim, {})
+
+                    oauth_roles = []
+
+                    if isinstance(claim_data, list):
+                        oauth_roles = claim_data
+                    elif isinstance(claim_data, str):
+                        # Split by the configured separator if present
+                        if OAUTH_ROLES_SEPARATOR and OAUTH_ROLES_SEPARATOR in claim_data:
+                            oauth_roles = claim_data.split(OAUTH_ROLES_SEPARATOR)
+                        else:
+                            oauth_roles = [claim_data]
+                    elif isinstance(claim_data, int):
+                        oauth_roles = [str(claim_data)]
 
             log.debug('Oauth Roles claim: %s', oauth_claim)
             log.debug('User roles from oauth: %s', oauth_roles)
@@ -1568,7 +1600,9 @@ class OAuthManager:
                         break
                 for admin_role in oauth_admin_roles:
                     if admin_role in oauth_roles:
-                        log.debug('Assigned user the admin role')
+                        log.debug(
+                            f"Assigned user the admin role based on group: {admin_role}"
+                        )
                         role = 'admin'
                         matched = True
                         break
@@ -1598,9 +1632,10 @@ class OAuthManager:
         user_data,
         provider,
         *,
+        access_token=None,
         db=None,
     ):
-        determined_role = await self.get_user_role(user, user_data)
+        determined_role = await self.get_user_role(user, user_data, provider, access_token)
         if user.role == determined_role:
             return user
 
@@ -1618,7 +1653,89 @@ class OAuthManager:
 
         return user
 
-    async def update_user_groups(self, request, user, user_data, default_permissions, db=None):
+    async def _fetch_google_groups_via_cloud_identity(
+        self, access_token: str, user_email: str
+    ) -> list[str]:
+        """
+        Fetch Google Workspace groups for a user via Cloud Identity API.
+
+        Args:
+            access_token: OAuth access token with cloud-identity.groups.readonly scope
+            user_email: User's email address
+
+        Returns:
+            List of group email addresses the user belongs to
+        """
+        groups = []
+        base_url = "https://content-cloudidentity.googleapis.com/v1/groups/-/memberships:searchTransitiveGroups"
+
+        query_string = f"member_key_id == '{user_email}' && 'cloudidentity.googleapis.com/groups.security' in labels"
+        encoded_query = quote(query_string)
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        page_token = ""
+
+        try:
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                while True:
+                    url = f"{base_url}?query={encoded_query}"
+
+                    if page_token:
+                        url += f"&pageToken={quote(page_token)}"
+
+                    log.debug("Fetching Google groups via Cloud Identity API")
+
+                    async with session.get(
+                        url, headers=headers, ssl=AIOHTTP_CLIENT_SESSION_SSL
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+
+                            memberships = data.get("memberships", [])
+                            log.debug(f"Found {len(memberships)} memberships")
+                            for membership in memberships:
+                                group_key = membership.get("groupKey", {})
+                                group_email = group_key.get("id", "")
+                                if group_email:
+                                    groups.append(group_email)
+                                    log.debug(f"Found group membership: {group_email}")
+
+                            page_token = data.get("nextPageToken", "")
+                            if not page_token:
+                                break
+                        else:
+                            error_text = await resp.text()
+                            log.error(
+                                f"Failed to fetch Google groups (status {resp.status})"
+                            )
+                            try:
+                                error_json = json.loads(error_text)
+                                if "error" in error_json:
+                                    log.error(f"API error: {error_json['error'].get('message', 'Unknown error')}")
+                            except json.JSONDecodeError:
+                                log.error("Error response contains non-JSON data")
+                            break
+
+        except Exception as e:
+            log.error(f"Error fetching Google groups via Cloud Identity API: {e}")
+
+        log.info(f"Retrieved {len(groups)} Google groups for user {user_email}")
+        return groups
+
+    async def update_user_groups(
+        self,
+        request,
+        user,
+        user_data,
+        default_permissions,
+        provider=None,
+        access_token=None,
+        db=None,
+    ):
         auth_config = await get_oauth_runtime_config()
         log.debug('Running OAUTH Group management')
         oauth_claim = auth_config.OAUTH_GROUPS_CLAIM
@@ -1630,23 +1747,31 @@ class OAuthManager:
             blocked_groups = []
 
         user_oauth_groups = []
-        # Nested claim search for groups claim
-        if oauth_claim:
-            claim_data = user_data
-            nested_claims = oauth_claim.split('.')
-            for nested_claim in nested_claims:
-                claim_data = claim_data.get(nested_claim, {})
 
-            if isinstance(claim_data, list):
-                user_oauth_groups = claim_data
-            elif isinstance(claim_data, str):
-                # Split by the configured separator if present
-                if OAUTH_GROUPS_SEPARATOR in claim_data:
-                    user_oauth_groups = claim_data.split(OAUTH_GROUPS_SEPARATOR)
+        # Check if Google groups were fetched via Cloud Identity API
+        if "google_groups" in user_data:
+            log.debug(
+                "Using Google groups from Cloud Identity API for group management"
+            )
+            user_oauth_groups = user_data["google_groups"]
+        else:
+            # Nested claim search for groups claim (traditional method)
+            if oauth_claim:
+                claim_data = user_data
+                nested_claims = oauth_claim.split(".")
+                for nested_claim in nested_claims:
+                    claim_data = claim_data.get(nested_claim, {})
+
+                if isinstance(claim_data, list):
+                    user_oauth_groups = claim_data
+                elif isinstance(claim_data, str):
+                    # Split by the configured separator if present
+                    if OAUTH_GROUPS_SEPARATOR in claim_data:
+                        user_oauth_groups = claim_data.split(OAUTH_GROUPS_SEPARATOR)
+                    else:
+                        user_oauth_groups = [claim_data]
                 else:
-                    user_oauth_groups = [claim_data]
-            else:
-                user_oauth_groups = []
+                    user_oauth_groups = []
 
         user_current_groups: list[GroupModel] = await Groups.get_groups_by_member_id(user.id, db=db)
         all_available_groups: list[GroupModel] = await Groups.get_all_groups(db=db)
@@ -2003,11 +2128,15 @@ class OAuthManager:
                     user = await Users.update_user_oauth_by_id(user.id, provider, sub, db=db) or user
 
             if user:
+                # Role is refreshed here (before the group-management gate below) so that the
+                # gate sees an up-to-date role. `access_token` is threaded through so Google
+                # Cloud Identity group memberships can drive role determination.
                 user = await self.update_user_role_from_oauth(
                     request=request,
                     user=user,
                     user_data=user_data,
                     provider=provider,
+                    access_token=token.get('access_token'),
                     db=db,
                 )
 
@@ -2092,12 +2221,16 @@ class OAuthManager:
                         log.warning('Username claim is missing, using email as name')
                         name = email
 
+                    role = await self.get_user_role(
+                        None, user_data, provider, token.get("access_token")
+                    )
+
                     user = await Auths.insert_new_auth(
                         email=email,
                         password=await get_password_hash(str(uuid.uuid4())),  # Random password, not used
                         name=name,
                         profile_image_url=picture_url,
-                        role=await self.get_user_role(None, user_data),
+                        role=role,
                         oauth=oauth_data,
                         db=db,
                     )
@@ -2133,12 +2266,16 @@ class OAuthManager:
                 data={'id': user.id},
                 expires_delta=parse_duration(auth_config.JWT_EXPIRES_IN),
             )
-            if auth_config.ENABLE_OAUTH_GROUP_MANAGEMENT:
+            # Admins are exempt: their group memberships are managed manually, so an IdP's
+            # group claims must not silently strip a configured admin's group access.
+            if auth_config.ENABLE_OAUTH_GROUP_MANAGEMENT and user.role != 'admin':
                 await self.update_user_groups(
                     request=request,
                     user=user,
                     user_data=user_data,
                     default_permissions=await Config.get('user.permissions'),
+                    provider=provider,
+                    access_token=token.get('access_token'),
                     db=db,
                 )
 
