@@ -1,6 +1,8 @@
 {
   "_comment": "Maps provider names to icon filenames. The provider name is extracted from model IDs automatically.",
   "_usage": "Model ID 'us.anthropic.claude-3-sonnet' → extracts 'anthropic' → uses 'anthropic.png'",
+  "_alias_note": "model_prefix_aliases are matched (startswith) BEFORE region-prefix stripping and before the split-on-first-dot fallback. They are required for two cases the dot-split cannot handle: (1) ids with no provider segment at all, e.g. 'gpt-4o', 'claude-3-5-sonnet-20241022', 'grok-4-latest', 'kimi-k2-0905'; (2) ids whose version contains a literal dot, e.g. 'glm-4.5' — without the 'glm-' alias that would split into a bogus provider 'glm-4'. The 'moonshotai.' alias maps that vendor segment onto the existing moonshot.png. Do not remove these without re-checking those ids.",
+  "_glm_note": "GLM/ChatGLM ships under several vendor segments: 'glm' (bare 'glm-4.5' via alias), 'zai' (Z.ai / Zhipu, e.g. 'zai.glm-4.7-flash'). All map to glm.png. Add 'zhipu' here too if a gateway ever serves that segment.",
 
   "providers": {
     "anthropic": "anthropic.png",
@@ -18,7 +20,10 @@
     "minimax": "minimax.png",
     "moonshot": "moonshot.png",
     "twelvelabs": "twelvelabs.png",
-    "writer": "writer.png"
+    "writer": "writer.png",
+    "xai": "grok.png",
+    "glm": "glm.png",
+    "zai": "glm.png"
   },
 
   "region_prefixes": [
@@ -29,6 +34,11 @@
   ],
 
   "model_prefix_aliases": {
-    "gpt-": "openai"
+    "gpt-": "openai",
+    "claude-": "anthropic",
+    "grok-": "xai",
+    "glm-": "glm",
+    "kimi-": "moonshot",
+    "moonshotai.": "moonshot"
   }
 }
