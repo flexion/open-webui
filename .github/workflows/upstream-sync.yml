@@ -104,8 +104,80 @@ jobs:
           echo "Will sync flex from ${BASE:-<none>} → ${TARGET}"
           echo "sync=true" >> "$GITHUB_OUTPUT"
 
+      # Cooldown gate (auto-upgrade design phase 1, stage 1 extension).
+      # Source of truth for "release age" is the GitHub Release object's
+      # published_at — not the git tag's taggerdate, which can predate the
+      # public release by hours or days.
+      #   - patch:        3-day soak before auto-PR
+      #   - minor:        7-day soak before auto-PR
+      #   - major:        never auto-PR (blocked → operator opens issue)
+      #   - pre-release:  never auto-PR (suffix on tag blocks regardless)
+      # `workflow_dispatch` with `force=true` (or explicit target_tag) bypasses.
+      - name: Cooldown gate
+        if: steps.decide.outputs.sync == 'true' && inputs.force != true
+        id: cooldown
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+          BASE: ${{ steps.base.outputs.base }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+
+          if [[ "$TARGET" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::notice title=Pre-release blocked::${TARGET} carries a pre-release suffix. Auto-PR refused; operator can target via workflow_dispatch."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$TARGET" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Target ${TARGET} does not match v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          T_MAJ="${BASH_REMATCH[1]}"; T_MIN="${BASH_REMATCH[2]}"; T_PAT="${BASH_REMATCH[3]}"
+
+          if [ -z "$BASE" ]; then
+            echo "::notice title=No base::First-time sync — treated as major bump, blocking auto-PR."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$BASE" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Base ${BASE} does not match v<major>.<minor>.<patch>"
+            exit 1
+          fi
+          B_MAJ="${BASH_REMATCH[1]}"; B_MIN="${BASH_REMATCH[2]}"
+
+          if [ "$T_MAJ" -ne "$B_MAJ" ]; then
+            echo "::notice title=Major bump blocked::${BASE} → ${TARGET} crosses a major boundary. Auto-PR refused."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TIER="patch"
+          WINDOW=$((3 * 24 * 60 * 60))
+          if [ "$T_MIN" -ne "$B_MIN" ]; then
+            TIER="minor"
+            WINDOW=$((7 * 24 * 60 * 60))
+          fi
+
+          PUBLISHED_AT=$(gh api "repos/open-webui/open-webui/releases/tags/${TARGET}" --jq '.published_at' 2>/dev/null || true)
+          if [ -z "$PUBLISHED_AT" ] || [ "$PUBLISHED_AT" = "null" ]; then
+            echo "::notice title=No release object::No GitHub Release exists for ${TARGET} yet. Holding for cooldown to start."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PUBLISHED_TS=$(date -d "$PUBLISHED_AT" +%s)
+          NOW_TS=$(date -u +%s)
+          AGE=$((NOW_TS - PUBLISHED_TS))
+
+          if [ "$AGE" -lt "$WINDOW" ]; then
+            echo "::notice title=Cooldown active::${TARGET} (${TIER}) released ${AGE}s ago; window is ${WINDOW}s. Re-evaluate next tick."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Cooldown satisfied: ${TARGET} (${TIER}) age=${AGE}s window=${WINDOW}s"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
       - name: Create throwaway branch
-        if: steps.decide.outputs.sync == 'true'
+        if: steps.decide.outputs.sync == 'true' && steps.cooldown.outputs.skip != 'true'
         id: branch
         env:
           TARGET: ${{ steps.target.outputs.target }}
@@ -115,7 +187,7 @@ jobs:
           git checkout -b "${BRANCH}"
 
       - name: Rebase onto target tag with deterministic conflict rules
-        if: steps.decide.outputs.sync == 'true'
+        if: steps.decide.outputs.sync == 'true' && steps.cooldown.outputs.skip != 'true'
         id: rebase
         env:
           TARGET: ${{ steps.target.outputs.target }}
@@ -190,7 +262,7 @@ jobs:
           fi
 
       - name: Push throwaway branch and open PR
-        if: steps.decide.outputs.sync == 'true'
+        if: steps.decide.outputs.sync == 'true' && steps.cooldown.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.branch.outputs.branch }}
