@@ -2,8 +2,17 @@ name: Upstream Sync
 
 on:
   schedule:
-    # Daily at 09:00 UTC (5am ET). Exits cleanly when no new upstream release.
-    - cron: '0 9 * * *'
+    # Bi-weekly (1st and 15th of each month) at 09:00 UTC (5am ET). Exits
+    # cleanly when no new upstream release.
+    #
+    # Checked upstream's (open-webui/open-webui) actual release cadence on
+    # 2026-09-25: releases cluster into a handful of patch tags a few days
+    # apart, and those clusters land roughly every 3-4 weeks (e.g. v0.9.0
+    # 04-21, v0.10.0 06-29, v0.11.0 07-27, v0.11.3 08-31, v0.11.4 09-21).
+    # Daily was needless noise for that cadence; cron has no native
+    # every-N-weeks interval, so 1st/15th approximates bi-weekly closely
+    # enough to keep sync lag low without running (and no-op'ing) most days.
+    - cron: '0 9 1,15 * *'
   workflow_dispatch:
     inputs:
       target_tag:
@@ -107,11 +116,16 @@ jobs:
           #
           # Do NOT use `git merge-base --is-ancestor` here. Upstream does not
           # keep linear tag ancestry: consecutive releases are frequently
-          # siblings rather than ancestor/descendant. For example upstream
-          # v0.9.5 (3660bc00) and v0.9.6 (1a97751e) diverge at a shared parent
-          # (41b48b54), so an ancestry test reports "not a descendant" for a
-          # perfectly valid forward sync. That mistake failed this workflow on
-          # 28 consecutive scheduled runs (2026-06-02 .. 2026-06-29).
+          # siblings rather than ancestor/descendant, so an ancestry test can
+          # report "not a descendant" for a perfectly valid forward sync. One
+          # historical example: upstream v0.9.5 (3660bc00) and v0.9.6
+          # (1a97751e) diverged at a shared parent (41b48b54). That bug class
+          # broke this workflow for 28 consecutive scheduled runs
+          # (2026-06-02 .. 2026-06-29) before this version-comparison guard
+          # replaced the ancestry check. If you're re-verifying this comment,
+          # don't assume that tag pair is still the most recent instance —
+          # spot-check current upstream tags for non-linear ancestry rather
+          # than trusting the cited versions as current.
           #
           # Compare release *versions* instead. The zero-padded numeric key
           # orders correctly across component rollovers (v0.9.9 < v0.10.0),
@@ -313,4 +327,5 @@ jobs:
             --base flex \
             --head "$BRANCH" \
             --title "chore: upstream-sync flex onto ${TARGET}" \
-            --body-file "$BODY_FILE"
+            --body-file "$BODY_FILE" \
+            --reviewer "flexion/opencode"
