@@ -1,0 +1,12 @@
+# Flexion code that lives inside files shared with upstream. scripts/upstream-sync.sh verify
+# fails the sync if any pattern disappears. Format: <path>|<extended regex>. Use * as the path
+# to search the whole tree, for code upstream may move to a different file.
+backend/open_webui/routers/models.py|def get_provider_icon_path\(
+backend/open_webui/routers/models.py|def get_provider_from_model_id\(
+backend/open_webui/routers/models.py|provider_icon_path = get_provider_icon_path\(
+backend/open_webui/config.py|os\.environ\.get\('OPENAI_API_CONFIGS'
+backend/open_webui/utils/oauth.py|cloud-identity\.groups\.readonly
+backend/open_webui/constants.py|MODEL_RECOMMENDATION = 'model_recommendation'
+backend/open_webui/routers/tasks.py|@router\.post\("/model_recommendation/completions"\)
+backend/open_webui/utils/task.py|def model_recommendation_template\(
+*|import ModelHelperModal from
