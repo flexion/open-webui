@@ -2,8 +2,17 @@ name: Upstream Sync
 
 on:
   schedule:
-    # Daily at 09:00 UTC (5am ET). Exits cleanly when no new upstream release.
-    - cron: '0 9 * * *'
+    # Bi-weekly (1st and 15th of each month) at 09:00 UTC (5am ET). Exits
+    # cleanly when no new upstream release.
+    #
+    # Checked upstream's (open-webui/open-webui) actual release cadence on
+    # 2026-09-25: releases cluster into a handful of patch tags a few days
+    # apart, and those clusters land roughly every 3-4 weeks (e.g. v0.9.0
+    # 04-21, v0.10.0 06-29, v0.11.0 07-27, v0.11.3 08-31, v0.11.4 09-21).
+    # Daily was needless noise for that cadence; cron has no native
+    # every-N-weeks interval, so 1st/15th approximates bi-weekly closely
+    # enough to keep sync lag low without running (and no-op'ing) most days.
+    - cron: '0 9 1,15 * *'
   workflow_dispatch:
     inputs:
       target_tag:
@@ -12,14 +21,20 @@ on:
         type: string
         default: ''
       force:
-        description: 'Open a PR even if flex already contains the target tag (useful for re-running a failed sync)'
+        description: 'Skip the up-to-date and backward-sync checks'
         required: false
         type: boolean
         default: false
 
+# No special token is needed. GITHUB_TOKEN may push a workflow file only if the
+# same path and contents already exist on another branch. The sync keeps `main`
+# an exact mirror of upstream, merges (rather than rebases) the tag into flex,
+# and sets every workflow file to either flex's or upstream's exact version, so
+# that condition always holds. scripts/upstream-sync.sh verify enforces it.
 permissions:
   contents: write
   pull-requests: write
+  actions: write # disable upstream's workflows on this fork
 
 concurrency:
   group: upstream-sync
@@ -28,13 +43,20 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      FLEX_REF: origin/flex
+      MIRROR_REF: origin/main
+      GH_TOKEN: ${{ github.token }}
+      # This repo is a fork, and the job adds an `upstream` remote. Without
+      # GH_REPO, `gh` resolves the base repo to the PARENT and API calls fail
+      # with "Resource not accessible by integration". Pin gh to this fork.
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Checkout flex with full history and tags
         uses: actions/checkout@v6
         with:
           ref: flex
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure git and fetch upstream tags
         run: |
@@ -57,7 +79,7 @@ jobs:
           else
             # Latest upstream release tag, strict semver pattern. Excludes
             # pre-releases (v0.9.6-rc1) and oddball tags.
-            TARGET=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)
+            TARGET=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | grep -v -- - | head -n 1)
             if [ -z "${TARGET}" ]; then
               echo "::error::No upstream v*.*.* tags found. Did upstream fetch fail?"
               exit 1
@@ -69,13 +91,14 @@ jobs:
       - name: Resolve current base on flex
         id: base
         run: |
-          # Most recent tag that's an ancestor of flex. With upstream's tags
-          # fetched, this is the upstream release flex is currently based on.
-          if BASE=$(git describe --tags --abbrev=0 flex 2>/dev/null); then
-            echo "flex's most-recent ancestor tag: ${BASE}"
+          # Most recent upstream release tag that's an ancestor of flex. Flexion's
+          # own tags (e.g. v0.9.4-flex.2) are excluded so they can't be mistaken
+          # for an upstream base.
+          if BASE=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' flex 2>/dev/null); then
+            echo "flex's most-recent upstream ancestor tag: ${BASE}"
           else
             BASE=""
-            echo "::warning::No tag is an ancestor of flex. First-time sync?"
+            echo "::warning::No upstream tag is an ancestor of flex. First-time sync?"
           fi
           echo "base=${BASE}" >> "$GITHUB_OUTPUT"
 
@@ -92,17 +115,84 @@ jobs:
             exit 0
           fi
 
-          # If BASE is set, verify TARGET is actually newer (not older — guard
-          # against operator-supplied target_tag pointing to a past release).
+          # Guard against syncing backward (e.g. an operator-supplied target_tag
+          # pointing at a past release).
+          #
+          # Do NOT use `git merge-base --is-ancestor` here. Upstream does not
+          # keep linear tag ancestry: consecutive releases are frequently
+          # siblings rather than ancestor/descendant, so an ancestry test can
+          # report "not a descendant" for a perfectly valid forward sync. One
+          # historical example: upstream v0.9.5 (3660bc00) and v0.9.6
+          # (1a97751e) diverged at a shared parent (41b48b54). That bug class
+          # broke this workflow for 28 consecutive scheduled runs
+          # (2026-06-02 .. 2026-06-29) before this version-comparison guard
+          # replaced the ancestry check. If you're re-verifying this comment,
+          # don't assume that tag pair is still the most recent instance —
+          # spot-check current upstream tags for non-linear ancestry rather
+          # than trusting the cited versions as current.
+          #
+          # Compare release *versions* instead. The zero-padded numeric key
+          # orders correctly across component rollovers (v0.9.9 < v0.10.0),
+          # which a lexical comparison would get wrong.
           if [ -n "${BASE}" ] && [ "${FORCE}" != "true" ]; then
-            if ! git merge-base --is-ancestor "${BASE}" "${TARGET}"; then
-              echo "::error::Target ${TARGET} is not a descendant of current base ${BASE}. Refusing to sync backward. Pass force=true to override."
+            ver_key() { printf '%s' "${1#v}" | awk -F. '{printf "%d%03d%03d", $1, $2, $3}'; }
+            KEY_BASE=$(ver_key "${BASE}")
+            KEY_TARGET=$(ver_key "${TARGET}")
+            if [ "${KEY_TARGET}" -lt "${KEY_BASE}" ]; then
+              echo "::error::Target ${TARGET} is older than current base ${BASE}. Refusing to sync backward. Pass force=true to override."
               exit 1
             fi
           fi
 
           echo "Will sync flex from ${BASE:-<none>} → ${TARGET}"
           echo "sync=true" >> "$GITHUB_OUTPUT"
+
+      - name: Make sure main mirrors the target release
+        if: steps.decide.outputs.sync == 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          # The merge must not push upstream commits or workflow files the repo
+          # doesn't already have on a branch, so main has to carry the tag first.
+          mirrored() {
+            git merge-base --is-ancestor "${TARGET}" "${MIRROR_REF}" \
+              && git diff --quiet "${TARGET}" "${MIRROR_REF}" -- .github/workflows
+          }
+          if mirrored; then
+            echo "${MIRROR_REF} already carries ${TARGET}."
+            exit 0
+          fi
+
+          echo "${MIRROR_REF} does not carry ${TARGET} yet; asking GitHub to sync the fork."
+          # GitHub refuses this with GITHUB_TOKEN when upstream changed workflow
+          # files, which happens for roughly 40% of releases. A human with write
+          # access can do the same sync from the web UI without any special token.
+          if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main; then
+            echo "::error title=Sync fork needed::GitHub would not sync main with GITHUB_TOKEN, most likely because upstream changed workflow files. Open ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/main, click 'Sync fork', then re-run this workflow."
+            exit 1
+          fi
+
+          git fetch origin main
+          if ! mirrored; then
+            echo "::error title=main does not match ${TARGET}::main was synced but its workflow files or history still don't match ${TARGET}, probably because upstream main has moved past the release. Re-run with target_tag set to the release main is on, or wait for the next release."
+            exit 1
+          fi
+
+      - name: Disable upstream workflows on this fork
+        if: steps.decide.outputs.sync == 'true'
+        run: |
+          # Upstream's workflow files are kept byte-identical so the push is
+          # allowed, which means they are live files here. Keep them from running
+          # (they fire on pushes to main, which the mirror receives) by disabling
+          # them. A disabled workflow stays disabled when its file changes.
+          gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate \
+            --jq '.workflows[] | select(.state == "active") | "\(.id) \(.path)"' |
+          while read -r id path; do
+            case "${path}" in .github/workflows/*) ;; *) continue ;; esac
+            scripts/upstream-sync.sh is-flex-workflow "${path}" && continue
+            echo "Disabling upstream workflow ${path}"
+            gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/${id}/disable"
+          done
 
       - name: Create throwaway branch
         if: steps.decide.outputs.sync == 'true'
@@ -114,100 +204,65 @@ jobs:
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
           git checkout -b "${BRANCH}"
 
-      - name: Rebase onto target tag with deterministic conflict rules
+      - name: Merge target tag with deterministic conflict rules
         if: steps.decide.outputs.sync == 'true'
-        id: rebase
+        id: merge
         env:
           TARGET: ${{ steps.target.outputs.target }}
-          BASE: ${{ steps.base.outputs.base }}
+          OUT_DIR: ${{ runner.temp }}/upstream-sync
         run: |
-          set +e
+          scripts/upstream-sync.sh merge "${TARGET}"
+          git show --remerge-diff HEAD > "${OUT_DIR}/remerge.diff"
+          echo "manual_count=$(grep -c . "${OUT_DIR}/manual-review.txt" || true)" >> "$GITHUB_OUTPUT"
 
-          {
-            echo "# Upstream sync conflict resolution log"
-            echo ""
-            echo "Rebasing \`flex\` from \`${BASE:-<none>}\` onto upstream \`${TARGET}\`."
-            echo ""
-            echo "| File | Rule applied | Outcome |"
-            echo "|------|--------------|---------|"
-          } > conflict-resolution-log.md
+      - name: Verify nothing Flexion-owned was lost
+        if: steps.decide.outputs.sync == 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.target }}
+          OUT_DIR: ${{ runner.temp }}/upstream-sync
+        run: scripts/upstream-sync.sh verify "${TARGET}"
 
-          : > manual-review.txt
-
-          git rebase "${TARGET}"
-          while [ -d .git/rebase-merge ] || [ -d .git/rebase-apply ]; do
-            CONFLICTS=$(git diff --name-only --diff-filter=U)
-
-            if [ -z "$CONFLICTS" ]; then
-              # Rebase paused but no unmerged paths — likely an empty/applied commit
-              git rebase --continue 2>/dev/null || git rebase --skip
-              continue
-            fi
-
-            for f in $CONFLICTS; do
-              case "$f" in
-                *.png|*.ico|*.wasm)
-                  git checkout --ours -- "$f"
-                  git add "$f"
-                  echo "| \`$f\` | binary → ours | resolved |" >> conflict-resolution-log.md
-                  ;;
-                package-lock.json|*/package-lock.json|uv.lock|*/uv.lock)
-                  git checkout --theirs -- "$f"
-                  git add "$f"
-                  echo "| \`$f\` | lockfile → theirs | resolved |" >> conflict-resolution-log.md
-                  ;;
-                functions/*|static/static/providers/*|README_FLEXION.md)
-                  git checkout --ours -- "$f"
-                  git add "$f"
-                  echo "| \`$f\` | flexion-unique → ours | resolved |" >> conflict-resolution-log.md
-                  ;;
-                *)
-                  # Shared source — leave conflict markers in the file content,
-                  # but `git add` so the rebase can continue. The committed file
-                  # will contain <<<<<<< markers for the human to resolve in the PR.
-                  git add "$f"
-                  echo "| \`$f\` | shared source — markers preserved | **manual review required** |" >> conflict-resolution-log.md
-                  echo "$f" >> manual-review.txt
-                  ;;
-              esac
-            done
-
-            git rebase --continue 2>/dev/null
-            REBASE_STATUS=$?
-            if [ $REBASE_STATUS -ne 0 ] && [ ! -d .git/rebase-merge ] && [ ! -d .git/rebase-apply ]; then
-              echo "::error::Rebase aborted unexpectedly after attempting to continue."
-              exit 1
-            fi
-          done
-          set -e
-
-          if [ -s manual-review.txt ]; then
-            sort -u manual-review.txt -o manual-review.txt
-            MANUAL_COUNT=$(wc -l < manual-review.txt | tr -d ' ')
-            echo "manual_count=${MANUAL_COUNT}" >> "$GITHUB_OUTPUT"
-          else
-            echo "manual_count=0" >> "$GITHUB_OUTPUT"
-          fi
+      - name: Upload sync logs
+        if: always() && steps.decide.outputs.sync == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-${{ steps.target.outputs.target }}
+          path: ${{ runner.temp }}/upstream-sync
+          if-no-files-found: ignore
 
       - name: Push throwaway branch and open PR
         if: steps.decide.outputs.sync == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.branch.outputs.branch }}
-          MANUAL_COUNT: ${{ steps.rebase.outputs.manual_count }}
+          MANUAL_COUNT: ${{ steps.merge.outputs.manual_count }}
           TARGET: ${{ steps.target.outputs.target }}
           BASE: ${{ steps.base.outputs.base }}
+          OUT_DIR: ${{ runner.temp }}/upstream-sync
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           git push -u origin "$BRANCH"
 
           BODY_FILE=$(mktemp)
-          cat conflict-resolution-log.md > "$BODY_FILE"
+          cat "${OUT_DIR}/conflict-resolution-log.md" > "$BODY_FILE"
 
           {
             echo ""
             echo "## Release"
             echo ""
-            echo "Syncing \`flex\` from **${BASE:-<none>}** to **${TARGET}**."
+            echo "Merges upstream **${TARGET}** into \`flex\` (previous base: **${BASE:-<none>}**)."
+            echo "The conflict resolutions (\`git show --remerge-diff\`) are in the [run's artifact](${RUN_URL})."
+            echo ""
+            echo "> [!IMPORTANT]"
+            echo "> Merge this PR with **Create a merge commit**. Squash or rebase would drop upstream's"
+            echo "> history from flex and break the next sync."
+            echo ""
+            echo "<details><summary>Flexion's changes on top of ${TARGET} after this merge</summary>"
+            echo ""
+            echo '```'
+            git diff --stat=120 "${TARGET}" HEAD | tail -n 200
+            echo '```'
+            echo ""
+            echo "</details>"
             echo ""
           } >> "$BODY_FILE"
 
@@ -215,10 +270,11 @@ jobs:
             {
               echo "## HITL review checklist"
               echo ""
-              echo "${MANUAL_COUNT} file(s) require manual resolution. The conflict markers"
+              echo "${MANUAL_COUNT} file(s) need manual resolution. Conflict markers"
               echo "(\`<<<<<<<\`, \`=======\`, \`>>>>>>>\`) are still in the committed content."
               echo ""
               echo "- [ ] Check out this branch, resolve markers, push"
+              echo "- [ ] Run \`scripts/upstream-sync.sh verify ${TARGET}\` locally"
               echo "- [ ] Run \`npm run build\` locally"
               echo "- [ ] Run \`docker build .\` locally"
               echo "- [ ] Verify Flexion branding, OAuth flow, and BAG integration still work"
@@ -228,7 +284,7 @@ jobs:
               echo "<details><summary>Files needing manual review (${MANUAL_COUNT})</summary>"
               echo ""
               echo '```'
-              cat manual-review.txt
+              cat "${OUT_DIR}/manual-review.txt"
               echo '```'
               echo ""
               echo "</details>"
@@ -236,7 +292,7 @@ jobs:
             DRAFT_FLAG="--draft"
           else
             {
-              echo "## Clean rebase"
+              echo "## Clean merge"
               echo ""
               echo "All conflicts were resolved by deterministic rules. No manual review needed."
               echo ""
@@ -251,4 +307,5 @@ jobs:
             --base flex \
             --head "$BRANCH" \
             --title "chore: upstream-sync flex onto ${TARGET}" \
-            --body-file "$BODY_FILE"
+            --body-file "$BODY_FILE" \
+            --reviewer "flexion/opencode"
