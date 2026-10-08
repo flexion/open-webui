@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
+import os
 import posixpath
 from typing import Optional
 from urllib.parse import unquote
@@ -16,8 +18,8 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import RedirectResponse, StreamingResponse
-from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STATIC_DIR
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import ENABLE_PROFILE_IMAGE_URL_FORWARDING, PROFILE_IMAGE_ALLOWED_MIME_TYPES
 from open_webui.events import EVENTS, publish_event
@@ -47,6 +49,73 @@ from sqlalchemy.ext.asyncio import AsyncSession
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Provider icon configuration is loaded from providers.json for easier maintenance
+# See static/static/providers/providers.json for the configuration
+_PROVIDER_CONFIG = None
+_PROVIDER_CONFIG_PATH = f"{STATIC_DIR}/providers/providers.json"
+
+
+def _load_provider_config() -> dict:
+    """Load provider icon configuration from JSON file."""
+    global _PROVIDER_CONFIG
+    if _PROVIDER_CONFIG is None:
+        try:
+            with open(_PROVIDER_CONFIG_PATH, "r") as f:
+                _PROVIDER_CONFIG = json.load(f)
+        except Exception as e:
+            log.warning(f"Failed to load provider config: {e}")
+            _PROVIDER_CONFIG = {
+                "providers": {},
+                "region_prefixes": [],
+                "model_prefix_aliases": {},
+            }
+    return _PROVIDER_CONFIG
+
+
+def get_provider_from_model_id(model_id: str) -> Optional[str]:
+    """
+    Extract the provider name from a model ID.
+
+    Examples:
+        'anthropic.claude-3-sonnet' → 'anthropic'
+        'us.anthropic.claude-3-sonnet' → 'anthropic'
+        'gpt-4o' → 'openai' (via alias)
+    """
+    config = _load_provider_config()
+    model_id_lower = model_id.lower()
+
+    # Check for special aliases first (e.g., 'gpt-' → 'openai')
+    for alias, provider in config.get("model_prefix_aliases", {}).items():
+        if model_id_lower.startswith(alias.lower()):
+            return provider
+
+    # Strip known region prefixes (us., eu., global., apac.)
+    for prefix in config.get("region_prefixes", []):
+        if model_id_lower.startswith(prefix.lower()):
+            model_id_lower = model_id_lower[len(prefix):]
+            break
+
+    # Extract provider from first segment (before the first dot)
+    if "." in model_id_lower:
+        return model_id_lower.split(".")[0]
+
+    return None
+
+
+def get_provider_icon_path(model_id: str) -> Optional[str]:
+    """
+    Returns the path to a provider-specific icon based on model ID.
+    Returns None if no matching provider icon is found.
+    """
+    config = _load_provider_config()
+    provider = get_provider_from_model_id(model_id)
+
+    if provider and provider in config.get("providers", {}):
+        icon_filename = config["providers"][provider]
+        return f"{STATIC_DIR}/providers/{icon_filename}"
+
+    return None
 
 
 def add_chat_variables_schema(model_dict: dict) -> dict:
@@ -711,6 +780,10 @@ async def get_model_profile_image(
                     url=safe_static,
                     status_code=status.HTTP_302_FOUND,
                 )
+
+    provider_icon_path = get_provider_icon_path(id)
+    if provider_icon_path and os.path.exists(provider_icon_path):
+        return FileResponse(provider_icon_path, media_type="image/png")
 
     # LICENSE covers this Open WebUI fallback logo.
     # Do not alter, remove, obscure, or replace it except as LICENSE permits:
