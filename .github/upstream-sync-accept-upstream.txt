@@ -1,0 +1,16 @@
+# Paths where taking upstream's version during a sync is CORRECT, and
+# scripts/upstream-sync.sh verify should therefore not treat it as a dropped
+# Flexion change.
+#
+# One path per line, exact match against a repository-relative path. Comments
+# start with #. Keep this list short: every entry is a Flexion change you are
+# agreeing to lose, so each one needs a reason next to it and should be removed
+# again once it no longer applies.
+#
+# Add a path here only in the same PR that takes upstream's version, so the
+# decision shows up in review as a visible diff instead of a silent revert.
+
+# Lock files are regenerated, never hand-merged. Upstream's is the right base;
+# if flex changed dependencies, regenerate after the sync.
+package-lock.json
+uv.lock
