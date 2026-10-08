@@ -1,0 +1,49 @@
+name: Upstream Sync Verify
+
+# The gate that was missing. "Upstream Sync" prepares a merge; a human then
+# resolves conflicts and pushes. Until now nothing re-checked that result —
+# backend.yaml/frontend.yaml only run on main and dev, so a sync PR into `flex`
+# had no CI at all, and two Flexion features reached `flex` silently deleted.
+#
+# This runs scripts/upstream-sync.sh verify on every push to an upstream-sync PR,
+# so the no-silent-drop and no-conflict-marker checks apply to what a human
+# actually ends up merging, not only to what the bot first produced.
+
+on:
+  pull_request:
+    branches: [flex]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: startsWith(github.head_ref, 'upstream-sync/')
+    runs-on: ubuntu-latest
+    env:
+      FLEX_REF: origin/flex
+      OUT_DIR: ${{ runner.temp }}/upstream-sync
+    steps:
+      - name: Checkout the PR head with full history
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream tags
+        run: |
+          git remote add upstream https://github.com/open-webui/open-webui.git
+          git fetch upstream --tags --prune --force
+
+      - name: Verify
+        # The target tag and the flex tip the sync was cut from are read from the
+        # merge commit's trailers, so this needs no inputs and cannot drift from
+        # what the merge actually did.
+        run: scripts/upstream-sync.sh verify
+
+      - name: Upload verify log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-sync-verify
+          path: ${{ runner.temp }}/upstream-sync
+          if-no-files-found: ignore
