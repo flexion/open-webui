@@ -118,8 +118,11 @@ cmd_merge() {
       "$WF_DIR"/*)
         : # handled wholesale below
         ;;
-      functions/*|static/static/providers/*|docs/*|.opencode/*|README_FLEXION.md|*.png|*.ico|*.wasm|*.jpg|*.woff2)
-        # Paths upstream has no stake in. Flexion's version wins outright.
+      functions/*|static/static/providers/*|.opencode/*|README_FLEXION.md|docs/oauth-google-groups.md|*.png|*.ico|*.wasm|*.jpg|*.woff2)
+        # Paths upstream has no stake in — verified against v0.11.4: upstream
+        # ships no functions/, no static/static/providers/, no .opencode/, and
+        # only docs/SECURITY.md under docs/, which is deliberately NOT matched
+        # here. Flexion's version wins outright.
         set_from HEAD "$f"
         log "$f" "kept flex's version (Flexion-owned path)"
         ;;
