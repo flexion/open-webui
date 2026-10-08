@@ -78,7 +78,7 @@ merge commit, so it needs no arguments and behaves identically in CI and on a fr
 
 #### Option A — Automated Sync (Recommended)
 
-The **Upstream Sync** workflow runs weekly (Mondays, 09:00 UTC) and can be run from
+The **Upstream Sync** workflow runs on the 1st and 15th of each month (09:00 UTC) and can be run from
 **Actions → Upstream Sync → Run workflow** with an optional `target_tag`. When upstream has a
 `v*.*.*` release newer than the one `flex` is on, it:
 
@@ -90,13 +90,15 @@ The **Upstream Sync** workflow runs weekly (Mondays, 09:00 UTC) and can be run f
    - lock files → upstream's, flagged for regeneration
    - everything else → conflict markers committed as-is for a human
 2. Runs `upstream-sync.sh verify`, uploads the log and the `--remerge-diff` as a run artifact.
-3. Pushes the branch and opens a **draft** PR into `flex`.
+3. Pushes the branch and opens a PR into `flex`.
 
-**The PR is always a draft, and CI never marks it ready.** `verify` proves nothing was silently
-dropped; it does not prove the result builds or that the resolutions are semantically right. A
-human finishes every sync.
+**The PR opens ready for review only if nothing needed manual resolution and `verify` passed.**
+Otherwise it opens as a **draft**, and CI never marks it ready on its own. Either way, `verify`
+proves nothing was silently dropped; it does not prove the result builds or that the resolutions
+are semantically right — run `npm run build` and `docker build .` before merging even a clean
+sync.
 
-**Finishing a sync:**
+**Finishing a sync that needed manual resolution:**
 
 ```bash
 git fetch origin && git fetch upstream --tags --prune --force
@@ -114,13 +116,15 @@ fire on `main`/`dev`). Merge with **Create a merge commit**, then publish to ECR
 **Token.** The workflow uses `GITHUB_TOKEN` by default. GitHub refuses a GitHub App token any
 push that creates or updates a file under `.github/workflows/`, and there is no `workflows`
 entry in a workflow's `permissions:` block to grant. This design sidesteps that by never
-changing that directory in a sync. If a push is still rejected (upstream commits that are new to
-this remote also carry workflow files), the run says so and offers two fixes: click **Sync fork**
-on `main` so those commits already exist here, or add a `SYNC_TOKEN` secret — a GitHub App
-installation token, or a fine-grained PAT with *Contents: write*, *Pull requests: write*,
-*Workflows: write* — which the workflow uses automatically when present. A classic PAT with the
-`workflow` scope also works but needs an org owner to authorize it, which is what stalled the
-earlier `UPSTREAM_SYNC_TOKEN` attempt.
+changing that directory in a sync, and by keeping `main` mirrored to upstream before merging
+(the "Mirror main from upstream" step calls the `merge-upstream` API; **confirmed working via a
+manual "Sync fork" click on 2026-10-08**), so the upstream commits a sync merges already exist on
+this remote and the push carries no new workflow-touching commits. If a push is still rejected,
+the run says so and offers two fixes: click **Sync fork** on `main` and re-run, or add a
+`SYNC_TOKEN` secret — a GitHub App installation token, or a fine-grained PAT with *Contents:
+write*, *Pull requests: write*, *Workflows: write* — which the workflow uses automatically when
+present. A classic PAT with the `workflow` scope also works but needs an org owner to authorize
+it, which is what stalled the earlier `UPSTREAM_SYNC_TOKEN` attempt.
 
 ---
 
@@ -141,6 +145,7 @@ scripts/upstream-sync.sh verify
 git push -u origin upstream-sync/vX.Y.Z
 gh pr create --draft --base flex --head upstream-sync/vX.Y.Z \
   --title "chore: upstream-sync flex onto vX.Y.Z"
+# drop --draft if the merge needed no manual resolution and verify passed
 ```
 
 Never force-push `flex`, and never rebase it onto a release.

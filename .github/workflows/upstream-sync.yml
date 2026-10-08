@@ -1,9 +1,12 @@
 name: Upstream Sync
 
 # Prepares a sync of `flex` onto a new upstream open-webui release and opens a
-# DRAFT pull request. It never produces a mergeable result on its own: a human
+# pull request. If the merge needed no human conflict resolution and `verify`
+# passed, the PR opens ready for review. Otherwise it opens as a DRAFT: a human
 # resolves the shared-source conflicts, runs the same script locally, and marks
-# the PR ready. "Upstream Sync Verify" then re-runs the checks on the PR.
+# the PR ready. "Upstream Sync Verify" then re-runs the checks on every push to
+# the PR either way, since `verify` proves nothing was silently dropped, not
+# that the result builds or that a resolution is semantically right.
 #
 # The mechanism lives entirely in scripts/upstream-sync.sh, which is what CI runs
 # and what a human runs. A failed CI sync is reproduced locally with:
@@ -16,11 +19,12 @@ name: Upstream Sync
 
 on:
   schedule:
-    # Weekly, Monday 09:00 UTC (5am ET). Upstream releases arrive in clusters
-    # every few weeks, so this bounds sync lag at 7 days while costing ~52
-    # no-op runs a year. Re-check the cadence if upstream's release rhythm
-    # changes; do not assume this comment is current.
-    - cron: '0 9 * * 1'
+    # 1st and 15th of the month, 09:00 UTC. Upstream releases arrive in
+    # clusters every 3-4 weeks, so this bounds sync lag at ~14 days while
+    # costing far fewer no-op runs than a daily or weekly schedule. Re-check
+    # the cadence if upstream's release rhythm changes; do not assume this
+    # comment is current.
+    - cron: '0 9 1,15 * *'
   workflow_dispatch:
     inputs:
       target_tag:
@@ -53,10 +57,11 @@ jobs:
       FLEX_REF: origin/flex
       OUT_DIR: ${{ github.workspace }}/.upstream-sync-out
       # SYNC_TOKEN is optional. See "Token" in the sync runbook in
-      # README_FLEXION.md: GITHUB_TOKEN is expected to be enough because the
-      # pushed branch changes no workflow file, but that has not been proven on
-      # a real run, and a GitHub App installation token is the documented
-      # fallback if GitHub still rejects the push.
+      # README_FLEXION.md: GITHUB_TOKEN is sufficient because the pushed branch
+      # changes no workflow file and main is kept mirrored to upstream (manual
+      # "Sync fork" confirmed working 2026-10-08), so the push below carries no
+      # unseen upstream commits. SYNC_TOKEN (a GitHub App installation token) is
+      # the documented fallback if GitHub still rejects a push.
       GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
       # This repo is a fork and the job adds an `upstream` remote. Without
       # GH_REPO, `gh` resolves the base repo to the PARENT and every API call
@@ -209,7 +214,7 @@ jobs:
           echo "::error title=Push rejected::Could not push ${BRANCH}. If the message above mentions workflow files, GitHub is refusing this token a push touching .github/workflows. The merge does not change that directory, so the cause is upstream commits new to this remote. Fix: open ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/tree/main and click 'Sync fork', then re-run; or add a SYNC_TOKEN secret (GitHub App installation token, or fine-grained PAT with Contents write + Pull requests write + Workflows write) and re-run. To reproduce locally: git switch -c ${BRANCH} origin/flex && scripts/upstream-sync.sh merge ${TARGET}"
           exit 1
 
-      - name: Open the draft PR
+      - name: Open the PR
         if: steps.decide.outputs.sync == 'true'
         id: pr
         env:
@@ -220,14 +225,35 @@ jobs:
           BASE: ${{ steps.base.outputs.base }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          # Conflict-free only if the merge left nothing for a human to resolve
+          # AND verify confirms nothing Flexion-owned was lost. Either failing
+          # means a human must look before this is mergeable, so it opens as a
+          # draft. Clean still isn't a build/boot guarantee -- `verify` can't
+          # see that -- so the clean body still asks for it before merging.
+          if [ "${MANUAL_COUNT}" = "0" ] && [ "${VERIFY}" = "success" ]; then
+            CLEAN=true
+          else
+            CLEAN=false
+          fi
+
           BODY_FILE=$(mktemp)
           {
             echo "Merges upstream **${TARGET}** into \`flex\` (previous base: **${BASE:-<none>}**)."
             echo ""
-            echo "> [!IMPORTANT]"
-            echo "> This PR is **not finished**. CI prepared the merge; a human finishes it."
-            echo "> Merge it with **Create a merge commit** — squash or rebase would strip"
-            echo "> upstream's history from \`flex\` and make the next sync re-resolve everything."
+            if [ "${CLEAN}" = "true" ]; then
+              echo "> [!NOTE]"
+              echo "> No shared-source files needed manual resolution, and \`upstream-sync.sh verify\`"
+              echo "> passed. Opened ready for review. **Still run \`npm run build\` and"
+              echo "> \`docker build .\`** before merging -- \`verify\` proves nothing was silently"
+              echo "> dropped, not that the result builds."
+              echo "> Merge it with **Create a merge commit** — squash or rebase would strip"
+              echo "> upstream's history from \`flex\` and make the next sync re-resolve everything."
+            else
+              echo "> [!IMPORTANT]"
+              echo "> This PR is **not finished**. CI prepared the merge; a human finishes it."
+              echo "> Merge it with **Create a merge commit** — squash or rebase would strip"
+              echo "> upstream's history from \`flex\` and make the next sync re-resolve everything."
+            fi
             echo ""
             echo "| | |"
             echo "|---|---|"
@@ -235,20 +261,24 @@ jobs:
             echo "| \`upstream-sync.sh verify\` in CI | ${VERIFY} |"
             echo "| Run log and remerge diff | [artifact](${RUN_URL}) |"
             echo ""
-            echo "## Finish this sync"
-            echo ""
-            echo '```bash'
-            echo "git fetch origin && git fetch upstream --tags --prune --force"
-            echo "git switch ${BRANCH}"
-            echo "# resolve the files listed in the merge commit message, then commit"
-            echo "scripts/upstream-sync.sh verify ${TARGET}"
-            echo '```'
-            echo ""
-            echo "- [ ] All conflict markers resolved; \`upstream-sync.sh verify\` passes locally"
+            if [ "${CLEAN}" != "true" ]; then
+              echo "## Finish this sync"
+              echo ""
+              echo '```bash'
+              echo "git fetch origin && git fetch upstream --tags --prune --force"
+              echo "git switch ${BRANCH}"
+              echo "# resolve the files listed in the merge commit message, then commit"
+              echo "scripts/upstream-sync.sh verify ${TARGET}"
+              echo '```'
+              echo ""
+              echo "- [ ] All conflict markers resolved; \`upstream-sync.sh verify\` passes locally"
+            fi
             echo "- [ ] \`npm run build\` succeeds"
             echo "- [ ] \`docker build .\` succeeds"
             echo "- [ ] Provider icons, Google OAuth Groups + admin exemption, and the Alembic chain still behave"
-            echo "- [ ] Mark ready for review"
+            if [ "${CLEAN}" != "true" ]; then
+              echo "- [ ] Mark ready for review"
+            fi
             echo ""
             cat "${OUT_DIR}/conflict-resolution-log.md"
             echo ""
@@ -269,11 +299,13 @@ jobs:
             echo "</details>"
           } > "$BODY_FILE"
 
-          # Always a draft. A sync is never certified by CI alone: `verify`
-          # proves nothing was silently dropped, not that the result builds or
-          # that the resolutions are semantically right.
+          DRAFT_FLAG=()
+          if [ "${CLEAN}" != "true" ]; then
+            DRAFT_FLAG=(--draft)
+          fi
+
           gh pr create \
-            --draft \
+            "${DRAFT_FLAG[@]}" \
             --base flex \
             --head "$BRANCH" \
             --title "chore: upstream-sync flex onto ${TARGET}" \
