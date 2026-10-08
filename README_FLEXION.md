@@ -28,151 +28,142 @@ git remote -v
 
 ---
 
+#### How syncing works
+
+`flex` takes upstream releases by **merging** the release tag. It is never rebased onto one.
+
+That single choice is the fix for the fork's worst recurring bug. The old rebase-based sync
+rewrote Flexion's commits one at a time; in CI `git rebase --continue` failed with no editor
+configured and the loop fell through to `git rebase --skip`, which dropped commits without a
+word. One sync kept 4 of flex's 17 commits. The rebase also had `--ours`/`--theirs` inverted —
+during a rebase `--ours` is the *upstream* side — so every "keep Flexion's version" rule kept
+upstream's instead. Two whole features (provider-icon-by-model-id and Google OAuth Groups)
+disappeared with no conflict and no error, and were caught only by someone reading the diff.
+
+A merge cannot do that. Flexion's commits keep their SHAs, the release tag becomes a real
+ancestor of `flex`, and every conflict is resolved once, in one merge commit, in the open.
+
+Three rules keep it that way:
+
+- **Never squash or rebase a sync PR.** Merge it with *Create a merge commit*. Squashing throws
+  away upstream's history, after which `git describe` can no longer tell which release `flex` is
+  on and the next sync re-resolves everything from scratch.
+- **`flex` owns `.github/workflows/` in full.** Upstream's workflow files live here renamed to
+  `*.disabled` so they cannot run on this fork, and a sync never takes upstream's versions of
+  them. That keeps the fork from re-activating upstream's release/publish jobs, and it means a
+  sync branch introduces no workflow-file change — which is what lets a plain `GITHUB_TOKEN`
+  push it.
+- **`scripts/upstream-sync.sh` is the whole mechanism.** CI runs exactly the two commands below,
+  so any failed CI sync is reproduced locally byte-for-byte.
+
+#### What `verify` actually checks
+
+`scripts/upstream-sync.sh verify` does not look for a list of things that ought to be present —
+a list like that only ever contains the drops someone already noticed. It derives the check
+instead. For every path Flexion touched relative to the release `flex` was previously on, the
+merge result must not be **missing** it and must not be **byte-identical to upstream's version
+at the new tag**. "Identical to upstream" is exactly what a silent drop looks like, and it is
+checkable without knowing what the change was.
+
+It also refuses any committed conflict marker, anywhere, unconditionally, and refuses any change
+to `.github/workflows/`.
+
+When taking upstream's version genuinely *is* right — a lock file, or a Flexion change upstream
+has since implemented natively — add the path to `.github/upstream-sync-accept-upstream.txt`
+with a comment. That turns the decision into a small reviewable diff instead of an invisible
+revert.
+
+`verify` reads the target tag, the `flex` tip and the manual-review list from trailers on the
+merge commit, so it needs no arguments and behaves identically in CI and on a fresh clone.
+
 #### Option A — Automated Sync (Recommended)
 
-The **Upstream Sync** GitHub Actions workflow runs **on a daily schedule** (09:00 UTC). Each day it checks upstream for a new `v*.*.*` release tag, and if there is one newer than the tag `flex` is currently based on, it rebases onto that tag and opens a PR. On days with no new release, it exits cleanly without making changes.
+The **Upstream Sync** workflow runs on the 1st and 15th of each month (09:00 UTC) and can be run from
+**Actions → Upstream Sync → Run workflow** with an optional `target_tag`. When upstream has a
+`v*.*.*` release newer than the one `flex` is on, it:
 
-**Prerequisites — configure this secret once in repo Settings → Secrets and variables → Actions:**
+1. Cuts `upstream-sync/<tag>-YYYYMMDD-HHMMSS` from `flex` and runs `upstream-sync.sh merge <tag>`,
+   which resolves conflicts by rule:
+   - `functions/`, `static/static/providers/`, `docs/`, `README_FLEXION.md`, binaries → Flexion's
+     version (in a merge, `--ours` really is `flex`)
+   - `.github/workflows/` → `flex`'s version, in full
+   - lock files → upstream's, flagged for regeneration
+   - everything else → conflict markers committed as-is for a human
+2. Runs `upstream-sync.sh verify`, uploads the log and the `--remerge-diff` as a run artifact.
+3. Pushes the branch and opens a PR into `flex`.
 
-| Secret | Description |
-|--------|-------------|
-| `SYNC_PAT` | GitHub fine-grained PAT with `Contents: write`, `Pull requests: write`, and `Workflows: write` on this repo. Required because `GITHUB_TOKEN` cannot push branches that contain `.github/workflows/` files. Must be SSO-authorized for the `flexion` org. |
+**The PR opens ready for review only if nothing needed manual resolution and `verify` passed.**
+Otherwise it opens as a **draft**, and CI never marks it ready on its own. Either way, `verify`
+proves nothing was silently dropped; it does not prove the result builds or that the resolutions
+are semantically right — run `npm run build` and `docker build .` before merging even a clean
+sync.
 
-**Manual runs (optional):**
+**Finishing a sync that needed manual resolution:**
 
-You can also trigger the workflow manually from **Actions → Upstream Sync → Run workflow**:
+```bash
+git fetch origin && git fetch upstream --tags --prune --force
+git switch upstream-sync/vX.Y.Z-...
+# resolve the files listed in the merge commit message, then commit
+scripts/upstream-sync.sh verify
+npm run build && docker build .
+```
 
-- Leave `target_tag` blank to auto-detect the latest upstream `v*.*.*` tag (same logic as the schedule)
-- Set `target_tag` to a specific tag (e.g. `v0.9.6`) to sync to that exact release
-- Set `force: true` to open a sync PR even if `flex` is already on the target tag
+Then mark the PR ready. **Upstream Sync Verify** re-runs `verify` on every push to the PR, which
+is the only CI this fork has on a `flex`-targeted PR (`backend.yaml` and `frontend.yaml` only
+fire on `main`/`dev`). Merge with **Create a merge commit**, then publish to ECR via the
+**Publish flex image to ECR** workflow (`version=<tag> environment=dev`, then `prod`).
 
-**What the workflow does:**
-1. Fetches all upstream tags
-2. Picks the target: the explicit `target_tag` input, or the latest `v*.*.*` tag from upstream
-3. Determines flex's current base via `git describe --tags --abbrev=0 flex`
-4. Exits cleanly if flex is already on the target (and `force` is not set)
-5. Refuses to sync backward (target older than current base) unless `force: true`
-6. Creates a throwaway branch `upstream-sync/<target>-YYYYMMDD-HHMMSS` from `flex`
-7. Rebases onto the target tag, applying these rules per conflicted file:
-   - Binary files (`*.png`, `*.ico`, `*.wasm`) → keeps Flexion's version (`--ours`)
-   - Lock files (`package-lock.json`, `uv.lock`) → takes upstream's version (`--theirs`); regenerate locally if needed
-   - Flexion-unique files (`functions/`, `static/static/providers/`, `README_FLEXION.md`) → keeps Flexion's version (`--ours`)
-   - Shared source files → conflict markers are committed as-is; the human resolves them in the PR
-8. Pushes the throwaway branch and opens a PR targeting `flex` — draft if any manual review is required, ready-for-review if the rebase was clean
-9. The PR body includes a conflict resolution log and (when applicable) a HITL review checklist with the list of files needing manual resolution
-
-**After the workflow opens a PR:**
-1. Review the conflict resolution log in the PR description
-2. If files need manual resolution: check out the branch, fix the markers, push, then mark the PR ready for review
-3. Verify Flexion features still work (see checklist in PR body)
-4. Approve and merge the PR
-5. Fast-forward `flex` locally:
-   ```bash
-   git checkout flex
-   git pull origin flex
-   ```
-6. Publish the new release tag to ECR by running the **Publish flex image to ECR** workflow with `version=<target_tag> environment=dev` (and `environment=prod` once dev is verified)
+**Token.** The workflow uses `GITHUB_TOKEN` by default. GitHub refuses a GitHub App token any
+push that creates or updates a file under `.github/workflows/`, and there is no `workflows`
+entry in a workflow's `permissions:` block to grant. This design sidesteps that by never
+changing that directory in a sync, and by keeping `main` mirrored to upstream before merging
+(the "Mirror main from upstream" step calls the `merge-upstream` API; **confirmed working via a
+manual "Sync fork" click on 2026-10-08**), so the upstream commits a sync merges already exist on
+this remote and the push carries no new workflow-touching commits. If a push is still rejected,
+the run says so and offers two fixes: click **Sync fork** on `main` and re-run, or add a
+`SYNC_TOKEN` secret — a GitHub App installation token, or a fine-grained PAT with *Contents:
+write*, *Pull requests: write*, *Workflows: write* — which the workflow uses automatically when
+present. A classic PAT with the `workflow` scope also works but needs an org owner to authorize
+it, which is what stalled the earlier `UPSTREAM_SYNC_TOKEN` attempt.
 
 ---
 
-#### Option B — Manual Rebase Runbook
+#### Option B — Manual Sync
 
-Use this when you need direct control, or when the automated workflow encounters issues.
-
-**Step 1 — Safety prep**
+Same script, same checks, your own push access. Use it when the workflow cannot finish.
 
 ```bash
-# Fetch latest from both remotes
-git fetch upstream
 git fetch origin
+git fetch upstream --tags --prune --force
 
-# Create a backup tag (recovery point)
-git tag flex-backup-pre-rebase-$(date +%Y%m%d) flex
-git push origin flex-backup-pre-rebase-$(date +%Y%m%d)
+git switch -c upstream-sync/vX.Y.Z origin/flex
+scripts/upstream-sync.sh merge vX.Y.Z
 
-# Create a throwaway working branch (never rebase flex directly)
-git checkout -b flex-rebase-onto-vX.Y.Z flex
+# resolve the files the merge commit lists, then commit
+scripts/upstream-sync.sh verify
+
+git push -u origin upstream-sync/vX.Y.Z
+gh pr create --draft --base flex --head upstream-sync/vX.Y.Z \
+  --title "chore: upstream-sync flex onto vX.Y.Z"
+# drop --draft if the merge needed no manual resolution and verify passed
 ```
 
-**Step 2 — Rebase**
-
-```bash
-git rebase upstream/main
-```
-
-**Step 3 — Resolve conflicts** (if any)
-
-Use this priority order for each conflicted file:
-
-| File Type | Command | Rationale |
-|-----------|---------|-----------|
-| Binary (`*.png`, `*.ico`, `*.wasm`) | `git checkout --ours <file> && git add <file>` | Not text-mergeable; Flexion icons are custom |
-| Lock files (`package-lock.json`, `uv.lock`) | `git checkout --theirs <file> && git add <file>` | Regenerated deterministically; take upstream's |
-| Flexion-unique (`functions/`, `static/static/providers/`, `README_FLEXION.md`) | `git checkout --ours <file> && git add <file>` | Entirely Flexion additions; upstream never touches these |
-| Shared source files (`oauth.py`, `models.py`, etc.) | Manual merge | Preserve Flexion intent, incorporate upstream structure |
-
-After resolving each file: `git add <file>` then `git rebase --continue`
-
-If a commit becomes empty after resolution: `git rebase --skip`
-
-If the rebase becomes unresolvable: `git rebase --abort` (your throwaway branch returns to its pre-rebase state)
-
-**Step 4 — Verify**
-
-```bash
-# Confirm upstream/main is an ancestor of the rebased branch
-git merge-base --is-ancestor upstream/main flex-rebase-onto-vX.Y.Z && echo "PASS"
-
-# Confirm Flexion commits are on top (should be 3)
-git log --oneline flex-rebase-onto-vX.Y.Z ^upstream/main
-
-# Confirm no merge commits (clean linear history)
-git log --merges flex-rebase-onto-vX.Y.Z ^upstream/main | wc -l  # must be 0
-```
-
-**Step 5 — Push and open draft PR**
-
-```bash
-git push --force-with-lease origin flex-rebase-onto-vX.Y.Z
-
-gh pr create \
-  --draft \
-  --base flex \
-  --head flex-rebase-onto-vX.Y.Z \
-  --title "feat: rebase Flexion customizations onto vX.Y.Z" \
-  --body "Upstream sync: vPREV → vX.Y.Z. See conflict log for details."
-```
-
-**Step 6 — After human review and approval**
-
-```bash
-# Fast-forward flex to the rebased branch
-git checkout flex
-git merge --ff-only flex-rebase-onto-vX.Y.Z
-git push --force-with-lease origin flex
-
-# Update origin/main to mirror upstream/main
-git checkout main
-git merge --ff-only upstream/main
-git push origin main
-
-# Clean up throwaway branch
-git branch -d flex-rebase-onto-vX.Y.Z
-git push origin --delete flex-rebase-onto-vX.Y.Z
-```
-
-Commit message pattern: `feat: rebase Flexion customizations onto vX.Y.Z`
+Never force-push `flex`, and never rebase it onto a release.
 
 ---
 
 #### Flexion Customization Inventory
 
-These files contain Flexion-specific changes that must survive every upstream sync:
+Orientation only. `scripts/upstream-sync.sh verify` derives the real list from the history on
+every run, so this table does not need to be complete for a sync to be safe — but keep it
+roughly current anyway, because it is what tells a reviewer *what to click through* after a sync.
 
 | File | Purpose | Conflict Risk |
 |------|---------|---------------|
-| `backend/open_webui/utils/oauth.py` | Google Groups OAuth implementation | High — upstream actively develops auth |
-| `backend/open_webui/routers/models.py` | Custom model routing | Medium |
+| `backend/open_webui/utils/oauth.py` | Google Groups OAuth + admin exemption | High — upstream actively develops auth |
+| `backend/open_webui/routers/models.py` | Provider-icon-by-model-id attribution | High — dropped silently twice already |
+| `backend/open_webui/migrations/versions/3c9b0ca343fd_*.py` | `down_revision` chained onto `flex0001_dup_email_repair` | High — upstream owns this file; losing the edit gives Alembic two heads and a boot crash loop |
+| `Dockerfile` | Node heap bump, IPv6 `no_proxy` strip, `FileResponse` import | High — upstream edits it every release |
 | `backend/open_webui/constants.py` | `TASKS.MODEL_RECOMMENDATION` enum value | Low — append-only |
 | `backend/open_webui/routers/tasks.py` | `POST /model_recommendation/completions` endpoint | Medium — task routing may change |
 | `backend/open_webui/utils/task.py` | `model_recommendation_template()` utility | Low — append-only |
